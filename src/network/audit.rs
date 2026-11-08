@@ -174,6 +174,8 @@ impl<N: NetworkPolicy> NetworkPolicy for Audited<N> {
     /// [`DenyAll`](crate::DenyAll) still skips the proxy entirely.
     const DENIES_ALL: bool = N::DENIES_ALL;
 
+    const HOST_ACCESS: bool = N::HOST_ACCESS;
+
     /// A decision that could not be recorded is answered as a refusal: an
     /// audited sandbox never opens a connection the log does not show.
     async fn check(&self, request: &DomainRequest) -> bool {
@@ -369,4 +371,6 @@ mod tests {
     // so it must be a property of the type rather than of a test run.
     const _: () = assert!(Audited::<DenyAll>::DENIES_ALL);
     const _: () = assert!(!Audited::<AllowAll>::DENIES_ALL);
+    const _: () = assert!(!Audited::<DenyAll>::HOST_ACCESS);
+    const _: () = assert!(!Audited::<AllowAll>::HOST_ACCESS);
 }

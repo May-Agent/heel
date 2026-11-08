@@ -159,7 +159,9 @@ const USER_DIRECTORIES: &[&str] = &["USERPROFILE", "APPDATA", "ALLUSERSPROFILE"]
 /// Windows sandbox backend.
 #[derive(Debug)]
 pub struct WindowsBackend {
-    container: Container,
+    /// The container the sandbox's processes run in, or `None` under host
+    /// access, where they launch on the user's own token.
+    container: Option<Container>,
     /// Whether the sandbox runs the filtering proxy, which decides the
     /// container's loopback exemption for its whole life.
     proxied: bool,
@@ -188,22 +190,38 @@ impl WindowsBackend {
     /// created, or if a configured path cannot be opened to it.
     pub fn new(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<Self> {
         crate::platform::require_windows_support(config)?;
+        // Host access creates no container: the process launches on the user's
+        // own token, so there is no package SID, no ACL grant and no loopback
+        // exemption to set up.
+        if config.host_access() {
+            return Ok(Self {
+                container: None,
+                proxied: false,
+            });
+        }
         let proxied = proxy_port.is_some();
         let container = match config.identity() {
             Some(identity) => Container::named(identity, NamedProfile::for_proxy(proxied))?.0,
             None => Container::create()?,
         };
         container.grant_configured_paths(config)?;
-        Ok(Self { container, proxied })
+        Ok(Self {
+            container: Some(container),
+            proxied,
+        })
     }
 
     /// Open the sandbox's IPC endpoint to the container.
     ///
     /// The endpoint is a named pipe — a kernel object whose default access
     /// control list names nothing an AppContainer token carries — so the pipe
-    /// bound for `socket` is granted once the server has bound it.
+    /// bound for `socket` is granted once the server has bound it. Host access
+    /// launches on the user's own token, which needs no grant.
     pub(crate) fn grant_ipc_endpoint(&self, socket: &Path) -> Result<()> {
-        self.container.grant_ipc_endpoint(socket)
+        self.container
+            .as_ref()
+            .expect("a confined sandbox has a container")
+            .grant_ipc_endpoint(socket)
     }
 
     /// Prepare everything one launch needs.
@@ -237,6 +255,15 @@ impl WindowsBackend {
                     )),
                 )
             })?;
+        // Host access launches on the user's own token: no package SID, no
+        // capabilities, nothing granted and no loopback exemption.
+        let Some(container) = self.container.as_ref() else {
+            return Ok(Prepared {
+                program,
+                capabilities: Vec::new(),
+                loopback: None,
+            });
+        };
         // The container was chosen for the sandbox's proxy decision, which a
         // launch cannot change.
         assert_eq!(
@@ -244,19 +271,18 @@ impl WindowsBackend {
             self.proxied,
             "a launch must agree with the proxy decision its container was created for"
         );
-        let capabilities = self.container.capabilities(self.proxied)?;
+        let capabilities = container.capabilities(self.proxied)?;
         // The program is the host's choice and is often reached through a link
         // (a shim), so the grant goes to what it resolves to, unless a sandbox
         // could have planted the link: the launch itself still names the program
         // as it was found.
         let granted = crate::resolve::resolve_outside(&program, &request.config.writable_paths())?;
-        self.container
-            .grant_program(granted.as_path(), &capabilities)?;
+        container.grant_program(granted.as_path(), &capabilities)?;
 
         // A proxy port means a filtering policy, which only works if the
         // container may reach the proxy on loopback.
         let loopback = match request.proxy_port {
-            Some(_) => self.container.exempt_loopback()?,
+            Some(_) => container.exempt_loopback()?,
             None => None,
         };
 
@@ -276,15 +302,16 @@ impl WindowsBackend {
         // request's stdout decides for all of them; every caller in this
         // crate asks for the same thing on all three anyway.
         let options = launch::Launch {
-            package: self.container.sid(),
+            package: self.container.as_ref().map(Container::sid),
             capabilities: &prepared.capabilities,
             exe: prepared.program,
             cmdline: command_line(&request),
             cwd: request.working_dir().to_path_buf(),
             env: environment(
                 &request,
-                self.container.local_app_data(),
-                self.container.profile_folder(),
+                self.container
+                    .as_ref()
+                    .map(|container| (container.local_app_data(), container.profile_folder())),
             ),
             stdio: stdio(request.stdout),
             memory_bytes: limits
@@ -326,8 +353,7 @@ impl WindowsBackend {
 /// them rather than at the point the variables are collected.
 fn environment(
     request: &SpawnRequest<'_>,
-    local_app_data: &Path,
-    profile_folder: &Path,
+    container_paths: Option<(&Path, &Path)>,
 ) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = request
         .envs
@@ -361,22 +387,37 @@ fn environment(
         }
     }
 
-    // Windows rewrites a child's LOCALAPPDATA to
-    // `<LOCALAPPDATA>\Packages\<profile>\AC` and derives TEMP/TMP beneath it.
-    // GetAppContainerFolderPath reports the existing profile folder; passing
-    // its validated base makes the rewritten value name that folder. The
-    // explicit TEMP/TMP values match what Windows derives, and TMPDIR follows
-    // TEMP for programs that consult it.
-    env.retain(|(name, _)| {
-        !["LOCALAPPDATA", "TEMP", "TMP", "TMPDIR"]
-            .iter()
-            .any(|reserved| env_name_eq(name, reserved))
-    });
-    let temp = profile_folder.join("Temp");
-    env.push(("LOCALAPPDATA".into(), local_app_data.as_os_str().to_owned()));
-    env.push(("TEMP".into(), temp.as_os_str().to_owned()));
-    env.push(("TMP".into(), temp.as_os_str().to_owned()));
-    env.push(("TMPDIR".into(), temp.as_os_str().to_owned()));
+    match container_paths {
+        // Windows rewrites a child's LOCALAPPDATA to
+        // `<LOCALAPPDATA>\Packages\<profile>\AC` and derives TEMP/TMP beneath
+        // it. GetAppContainerFolderPath reports the existing profile folder;
+        // passing its validated base makes the rewritten value name that
+        // folder. The explicit TEMP/TMP values match what Windows derives, and
+        // TMPDIR follows TEMP for programs that consult it.
+        Some((local_app_data, profile_folder)) => {
+            env.retain(|(name, _)| {
+                !["LOCALAPPDATA", "TEMP", "TMP", "TMPDIR"]
+                    .iter()
+                    .any(|reserved| env_name_eq(name, reserved))
+            });
+            let temp = profile_folder.join("Temp");
+            env.push(("LOCALAPPDATA".into(), local_app_data.as_os_str().to_owned()));
+            env.push(("TEMP".into(), temp.as_os_str().to_owned()));
+            env.push(("TMP".into(), temp.as_os_str().to_owned()));
+            env.push(("TMPDIR".into(), temp.as_os_str().to_owned()));
+        }
+        // Host access runs on the user's own token, so the user's own
+        // variables are inherited like the other user directories.
+        None => {
+            for name in ["LOCALAPPDATA", "TEMP", "TMP", "TMPDIR"] {
+                if let Some(value) = std::env::var_os(name)
+                    && !supplied(&env, name)
+                {
+                    env.push((name.into(), value));
+                }
+            }
+        }
+    }
 
     env.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_lowercase());
     env

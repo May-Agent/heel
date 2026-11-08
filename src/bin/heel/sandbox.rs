@@ -1,8 +1,8 @@
 //! Bridge from the CLI's runtime configuration to the library's generics.
 
 use heel::{
-    AllowAll, AllowList, Audited, Command, DenyAll, NetworkAuditLog, NetworkPolicy, PythonConfig,
-    Sandbox, SandboxConfig, SandboxConfigBuilder, VenvConfig,
+    AllowAll, AllowList, Audited, Command, DenyAll, HostAccess, NetworkAuditLog, NetworkPolicy,
+    PythonConfig, Sandbox, SandboxConfig, SandboxConfigBuilder, VenvConfig,
 };
 
 use crate::cli::NetworkMode;
@@ -19,6 +19,7 @@ pub enum SandboxHandle {
     AllowList(Sandbox<AllowList>),
     AuditedAllowAll(Sandbox<Audited<AllowAll>>),
     AuditedAllowList(Sandbox<Audited<AllowList>>),
+    HostAccess(Sandbox<HostAccess>),
 }
 
 /// Run the same expression against whichever policy the sandbox was built with.
@@ -30,6 +31,7 @@ macro_rules! dispatch {
             SandboxHandle::AllowList($sandbox) => $body,
             SandboxHandle::AuditedAllowAll($sandbox) => $body,
             SandboxHandle::AuditedAllowList($sandbox) => $body,
+            SandboxHandle::HostAccess($sandbox) => $body,
         }
     };
 }
@@ -84,6 +86,13 @@ async fn create_with_builder<I>(
     builder: SandboxConfigBuilder<heel::DenyAll, I>,
 ) -> CliResult<SandboxHandle> {
     let venv = python_venv_config(config, paths);
+
+    if config.isolation == crate::cli::Isolation::Host {
+        return Ok(SandboxHandle::HostAccess(
+            Sandbox::with_config(build(builder.host_access(), config, paths, venv)).await?,
+        ));
+    }
+
     let audit = config
         .audit_log
         .as_deref()

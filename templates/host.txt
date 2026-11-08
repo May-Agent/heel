@@ -1,0 +1,17 @@
+(version 1)
+; Host access: no confinement. The process runs with the invoking user's full
+; access to the filesystem, the network and devices; filesystem grants,
+; security toggles and denylists have no effect.
+(allow default)
+
+; =============================================================================
+; Process attribution
+;
+; The only rules this profile carries. The host asks the kernel whether a
+; process's profile denies the marker and allows the control, which tells a
+; descendant of this sandbox from every other process after it has left the
+; process group, been reparented and executed another program. The control is
+; what keeps another sandbox, which may deny any path, from matching.
+; =============================================================================
+(deny file-read-data (literal "{{ marker }}") {{ audit }})
+(allow file-read-data (literal "{{ control }}"))
