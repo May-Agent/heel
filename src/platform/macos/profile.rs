@@ -352,17 +352,44 @@ struct SandboxProfile {
     control: String,
 }
 
+/// SBPL profile template for host access: everything allowed, attribution kept.
+#[derive(Template)]
+#[template(path = "host.txt", escape = "none")]
+struct HostProfile {
+    audit: String,
+    marker: String,
+    control: String,
+}
+
 /// Generate an SBPL profile from a sandbox configuration.
 ///
 /// `proxy_port` is `Some` only when the network policy permits traffic; when it
-/// is `None` the profile denies all outbound connections in the kernel.
+/// is `None` the profile denies all outbound connections in the kernel. A
+/// host-access configuration instead renders the profile that confines
+/// nothing and keeps only the attribution pair.
 pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<String> {
-    let security = config.security();
     let attribution = config.attribution().ok_or_else(|| {
         Error::InitFailed(
             "a sandbox profile needs the attribution files its sandbox creates".to_string(),
         )
     })?;
+
+    if config.host_access() {
+        let profile = HostProfile {
+            audit: format!(
+                "(with message \"{}\")",
+                escape_str(&denial_tag(config.working_dir()))
+            ),
+            marker: sbpl_path(attribution.marker())?,
+            control: sbpl_path(attribution.control())?,
+        }
+        .render()?;
+        tracing::debug!(working_dir = %config.working_dir().display(), "generated host-access SBPL profile");
+        tracing::trace!("SBPL profile:\n{profile}");
+        return Ok(profile);
+    }
+
+    let security = config.security();
     let grants = grant_rules(config.grants())?;
     let openings = openings(config, &grants)?;
 
@@ -646,6 +673,38 @@ mod tests {
 
         assert!(profile.contains("(deny network*)"));
         assert!(profile.contains("(allow network-outbound (remote ip \"localhost:23456\"))"));
+    }
+
+    #[test]
+    fn a_host_access_profile_confines_nothing_but_keeps_attribution() {
+        let (data, dir) = prepared_config(SandboxConfig::builder().host_access().build());
+        let profile = generate_profile(&data, None).unwrap();
+
+        assert!(profile.contains("(version 1)"));
+        assert!(profile.contains("(allow default)"));
+        assert!(!profile.contains("(deny default"), "{profile}");
+        assert!(!profile.contains("(deny network*)"), "{profile}");
+        assert!(
+            !profile.contains("(deny file-read* (subpath \"/Users\")"),
+            "{profile}"
+        );
+
+        let attribution = data.attribution().unwrap();
+        let tag = crate::denial::denial_tag(dir.path());
+        assert!(
+            profile.contains(&format!(
+                "(deny file-read-data (literal \"{}\") (with message \"{tag}\"))",
+                attribution.marker().display()
+            )),
+            "the marker denial is tagged like every other denial:\n{profile}"
+        );
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read-data (literal \"{}\"))",
+                attribution.control().display()
+            )),
+            "{profile}"
+        );
     }
 
     #[test]

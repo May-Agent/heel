@@ -419,6 +419,9 @@ pub enum Isolation {
     Default,
     /// The whole filesystem is readable and writable. Not supported on Windows.
     Permissive,
+    /// The process runs with the invoking user's full access; only IPC,
+    /// process tracking and limits remain.
+    Host,
 }
 
 /// Which network policy to apply.

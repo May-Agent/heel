@@ -67,6 +67,11 @@ pub enum CliError {
     )]
     MissingIpcEndpoint,
 
+    #[error(
+        "--isolation host runs the process with the invoking user's full access, which an explicit --network deny contradicts"
+    )]
+    HostAccessWithDeny,
+
     #[error("IPC error: {0}")]
     Ipc(#[from] heel::IpcError),
 

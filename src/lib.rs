@@ -37,6 +37,7 @@
 //! - [`AllowList`] - allow specific domains, with `*.example.com` wildcards
 //! - [`CustomPolicy`] - decide per request with an async handler
 //! - [`Audited`] - wrap any policy to record its decisions
+//! - [`HostAccess`] - no confinement: the invoking user's full access
 //!
 //! # Filesystem
 //!
@@ -144,8 +145,8 @@ pub use grant::{Access, Grant, ParseAccessError};
 pub use identity::Identity;
 pub use ipc::{CommandMeta, IpcClient, IpcCommand, IpcContext, IpcError, IpcRouter, NoArgs};
 pub use network::{
-    AllowAll, AllowList, Audited, CustomPolicy, DenyAll, DomainRequest, NetworkAuditLog,
-    NetworkPolicy,
+    AllowAll, AllowList, Audited, CustomPolicy, DenyAll, DomainRequest, HostAccess,
+    NetworkAuditLog, NetworkPolicy,
 };
 pub use platform::Child;
 #[cfg(target_os = "macos")]

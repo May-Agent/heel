@@ -163,17 +163,21 @@ pub fn merge_config(file: FileConfig, cli: &CommonArgs) -> CliResult<MergedConfi
         env_set.insert(key.to_string(), value.to_string());
     }
 
-    let network_mode = cli.network.or(file.network).unwrap_or_default();
+    let network_explicit = cli.network.or(file.network);
+    let network_mode = network_explicit.unwrap_or_default();
     let allow_domains = concat(file.allow_domains, &cli.allow_domains);
     if network_mode == NetworkMode::AllowList && allow_domains.is_empty() {
         return Err(CliError::MissingAllowDomains);
     }
 
-    // An audit log records what the proxy decided, and a deny-all policy runs
-    // no proxy: the kernel refuses every connection before a policy sees it, so
-    // the log would stay empty rather than recording denials.
+    // Host access opens the whole network; an explicit deny contradicts it.
+    // The flag is otherwise irrelevant — host access runs no proxy, so an
+    // audit log would record nothing either.
+    if isolation == Isolation::Host && network_explicit == Some(NetworkMode::Deny) {
+        return Err(CliError::HostAccessWithDeny);
+    }
     let audit_log = cli.audit_log.clone().or(file.audit_log);
-    if audit_log.is_some() && network_mode == NetworkMode::Deny {
+    if audit_log.is_some() && (network_mode == NetworkMode::Deny || isolation == Isolation::Host) {
         return Err(CliError::AuditLogWithoutProxy);
     }
 
@@ -355,7 +359,7 @@ impl Isolation {
     pub fn security_preset(self) -> SecurityConfig {
         match self {
             Self::Strict | Self::Default => SecurityConfig::strict(),
-            Self::Permissive => SecurityConfig::permissive(),
+            Self::Permissive | Self::Host => SecurityConfig::permissive(),
         }
     }
 
@@ -561,6 +565,26 @@ mod tests {
         // The file disabled both; the command line re-enabled one of them.
         assert!(!merged.security.protect_credentials());
         assert!(merged.security.allow_gpu());
+    }
+
+    #[test]
+    fn host_isolation_maps_to_the_full_access_mode() {
+        let merged = merge_config(
+            FileConfig::default(),
+            &common_args(&["--isolation", "host"]),
+        )
+        .expect("merges");
+        assert_eq!(merged.isolation, Isolation::Host);
+    }
+
+    #[test]
+    fn host_isolation_rejects_an_explicit_network_deny() {
+        let error = merge_config(
+            FileConfig::default(),
+            &common_args(&["--isolation", "host", "--network", "deny"]),
+        )
+        .expect_err("must fail");
+        assert!(matches!(error, CliError::HostAccessWithDeny));
     }
 
     #[test]

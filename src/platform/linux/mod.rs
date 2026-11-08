@@ -26,8 +26,8 @@ pub struct LinuxBackend {
     /// The broker, when the configuration needs one.
     broker: Option<broker::Broker>,
     /// The Landlock ruleset every command of the sandbox is restricted by, built
-    /// once with the sandbox.
-    ruleset: landlock_rules::PreparedRuleset,
+    /// once with the sandbox. `None` under host access, which confines nothing.
+    ruleset: Option<landlock_rules::PreparedRuleset>,
     /// Where the denials the broker records are collected.
     sink: Arc<broker::sink::DenialSink>,
 }
@@ -81,6 +81,19 @@ impl LinuxBackend {
     /// forking a multi-threaded process and then allocating in the child is
     /// unsound.
     pub fn new(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<Self> {
+        let sink = Arc::new(broker::sink::DenialSink::default());
+
+        // Host access confines nothing: no Landlock, no seccomp, no broker, so
+        // the kernel is not probed and a host without Landlock still works.
+        if config.host_access() {
+            tracing::info!("Linux sandbox backend initialized (host access)");
+            return Ok(Self {
+                broker: None,
+                ruleset: None,
+                sink,
+            });
+        }
+
         let kernel = detect_kernel_version()?;
         if kernel < MIN_KERNEL_VERSION {
             return Err(Error::UnsupportedPlatformVersion {
@@ -92,7 +105,6 @@ impl LinuxBackend {
 
         landlock_rules::probe_support()?;
 
-        let sink = Arc::new(broker::sink::DenialSink::default());
         let (broker, ruleset) = match broker::Broker::new(config, proxy_port, Arc::clone(&sink))? {
             Some((broker, ruleset)) => (Some(broker), ruleset),
             None => (None, landlock_rules::build_ruleset(config, proxy_port)?),
@@ -101,7 +113,7 @@ impl LinuxBackend {
         tracing::info!(%kernel, broker = broker.is_some(), "Linux sandbox backend initialized");
         Ok(Self {
             broker,
-            ruleset,
+            ruleset: Some(ruleset),
             sink,
         })
     }
@@ -128,7 +140,11 @@ impl LinuxBackend {
         // Built here, on the host, so that the post-fork path only issues
         // syscalls. A duplicate of the sandbox's ruleset descriptor: the ruleset
         // itself, pool rules included, was built once with the sandbox.
-        let ruleset = self.ruleset.try_clone()?;
+        let mut ruleset = self
+            .ruleset
+            .as_ref()
+            .map(landlock_rules::PreparedRuleset::try_clone)
+            .transpose()?;
         let (hook, listener) = match &self.broker {
             Some(broker) => {
                 let (hook, listener) = broker.prepare()?;
@@ -137,7 +153,11 @@ impl LinuxBackend {
             None => (None, None),
         };
         let allow_tcp = request.proxy_port.is_some();
-        let filter = seccomp_filter::build_filter(allow_tcp)?;
+        // Host access installs no filter at all: the process keeps the
+        // invoking user's syscalls, including every socket family.
+        let mut filter = (!request.config.host_access())
+            .then(|| seccomp_filter::build_filter(allow_tcp))
+            .transpose()?;
         let setup = PreExecSetup::new(request.config)?;
 
         let mut cmd = Command::new(request.program);
@@ -153,9 +173,6 @@ impl LinuxBackend {
         for (key, value) in request.envs {
             cmd.env(key, value);
         }
-
-        let mut ruleset = Some(ruleset);
-        let mut filter = Some(filter);
 
         if let Some(fd) = request.inherit_fd {
             // SAFETY: `fcntl` is async-signal-safe and allocates nothing; the
@@ -182,22 +199,19 @@ impl LinuxBackend {
                 // are in place whatever the rest of the hook restricts.
                 setup.apply()?;
 
-                // Both values are consumed on first use; a second call would
-                // mean the command was spawned twice from one builder, which
-                // must fail rather than silently run unsandboxed.
-                ruleset
-                    .take()
-                    .ok_or_else(|| std::io::Error::other("Landlock ruleset already applied"))?
-                    .restrict_self()?;
+                // Both values are consumed on first use; under host access
+                // there is neither and the hook only applies the limits.
+                if let Some(ruleset) = ruleset.take() {
+                    ruleset.restrict_self()?;
+                }
 
                 if let Some(hook) = &hook {
                     hook.install()?;
                 }
 
-                filter
-                    .take()
-                    .ok_or_else(|| std::io::Error::other("seccomp filter already applied"))?
-                    .apply()?;
+                if let Some(filter) = filter.take() {
+                    filter.apply()?;
+                }
 
                 Ok(())
             });

@@ -57,6 +57,14 @@ pub trait NetworkPolicy: Send + Sync + 'static {
     /// set this when [`NetworkPolicy::check`] can never return `true`.
     const DENIES_ALL: bool = false;
 
+    /// Whether this policy grants the process the invoking user's full access.
+    ///
+    /// When `true` the sandbox applies no confinement at all: no proxy, no
+    /// filesystem boundary and no network boundary. Only IPC, process tracking,
+    /// resource limits and scheduling priority remain. Implementations must
+    /// only set this when [`NetworkPolicy::check`] can never return `false`.
+    const HOST_ACCESS: bool = false;
+
     /// Check whether a request should be allowed.
     fn check(&self, request: &DomainRequest) -> impl Future<Output = bool> + Send;
 }
@@ -78,6 +86,23 @@ impl NetworkPolicy for DenyAll {
 pub struct AllowAll;
 
 impl NetworkPolicy for AllowAll {
+    async fn check(&self, _request: &DomainRequest) -> bool {
+        true
+    }
+}
+
+/// The invoking user's full access, not a network policy in the usual sense.
+///
+/// A sandbox built with `HostAccess` confines nothing: the process can read,
+/// write and execute everywhere its user can, and connects anywhere without
+/// a proxy. heel still provides IPC, process tracking, resource limits and
+/// scheduling priority.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostAccess;
+
+impl NetworkPolicy for HostAccess {
+    const HOST_ACCESS: bool = true;
+
     async fn check(&self, _request: &DomainRequest) -> bool {
         true
     }
@@ -173,6 +198,11 @@ mod tests {
     const _: () = assert!(DenyAll::DENIES_ALL);
     const _: () = assert!(!AllowAll::DENIES_ALL);
     const _: () = assert!(!AllowList::DENIES_ALL);
+    const _: () = assert!(!DenyAll::HOST_ACCESS);
+    const _: () = assert!(!AllowAll::HOST_ACCESS);
+    const _: () = assert!(!AllowList::HOST_ACCESS);
+    const _: () = assert!(HostAccess::HOST_ACCESS);
+    const _: () = assert!(!HostAccess::DENIES_ALL);
 
     #[test]
     fn deny_all_rejects_every_request() {

@@ -145,6 +145,10 @@ pub(crate) fn create_native_backend(
 /// the caller wrote down, so it is refused too.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn require_windows_support(config: &SandboxConfigData) -> Result<()> {
+    // Host access enforces none of these settings, so nothing is refused.
+    if config.host_access() {
+        return Ok(());
+    }
     let refused = if config.writable_file_system() {
         Some("writable_file_system")
     } else if config.read_denylist().is_some() {
