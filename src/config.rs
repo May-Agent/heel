@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::grant::{Access, Grant};
 use crate::identity::Identity;
 use crate::ipc::IpcRouter;
-use crate::network::{DenyAll, NetworkPolicy};
+use crate::network::{DenyAll, HostAccess, NetworkPolicy};
 use crate::policy::{ReadDenylist, WriteDenylist};
 use crate::priority::ProcessPriority;
 use crate::resolve::ResolvedPath;
@@ -327,6 +327,7 @@ pub struct SandboxConfigData {
     grants: Vec<Grant>,
     identity: Option<Identity>,
     network_deny_all: bool,
+    host_access: bool,
     python: Option<PythonConfig>,
     working_dir: PathBuf,
     working_dir_auto: bool,
@@ -390,6 +391,16 @@ impl SandboxConfigData {
     /// outbound traffic in the kernel instead of in the proxy.
     pub fn network_deny_all(&self) -> bool {
         self.network_deny_all
+    }
+
+    /// Whether the sandbox applies no confinement and the process runs with
+    /// the invoking user's full access.
+    ///
+    /// When `true` every filesystem grant, security toggle, denylist and
+    /// network setting is ignored: the backend still provides IPC, process
+    /// tracking, resource limits and scheduling priority, and nothing else.
+    pub fn host_access(&self) -> bool {
+        self.host_access
     }
 
     /// Python configuration, if any.
@@ -659,6 +670,7 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 grants: Vec::new(),
                 identity: None,
                 network_deny_all: DenyAll::DENIES_ALL,
+                host_access: DenyAll::HOST_ACCESS,
                 python: None,
                 // Resolved on build(); replaced by the canonical path when the
                 // sandbox creates it.
@@ -698,12 +710,23 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     pub fn network<M: NetworkPolicy>(self, policy: M) -> SandboxConfigBuilder<M, I> {
         let mut data = self.data;
         data.network_deny_all = M::DENIES_ALL;
+        data.host_access = M::HOST_ACCESS;
         SandboxConfigBuilder {
             network: policy,
             data,
             ipc: self.ipc,
             ipc_state: self.ipc_state,
         }
+    }
+
+    /// Run the process with the invoking user's full access.
+    ///
+    /// No confinement: the sandboxed process can read, write, execute and
+    /// connect everywhere its user can. heel still provides IPC, process
+    /// tracking, resource limits and scheduling priority; filesystem grants,
+    /// security toggles and denylists have no effect.
+    pub fn host_access(self) -> SandboxConfigBuilder<HostAccess, I> {
+        self.network(HostAccess)
     }
 
     /// Set the fine-grained protection toggles.

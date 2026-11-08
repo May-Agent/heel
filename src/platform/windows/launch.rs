@@ -72,8 +72,9 @@ pub(super) enum Stdio {
 
 /// Everything one launch needs, assembled before the process starts.
 pub(super) struct Launch<'a> {
-    /// The container's package SID.
-    pub(super) package: &'a Sid,
+    /// The container's package SID, or `None` under host access, where the
+    /// process launches on the user's own token.
+    pub(super) package: Option<&'a Sid>,
     /// The capabilities granted to this process.
     pub(super) capabilities: &'a [Sid],
     /// Program to run.
@@ -253,15 +254,23 @@ pub(super) fn launch(launch: &Launch<'_>) -> Result<Launched> {
         }
     }
 
-    let capabilities = SecurityCapabilities::new(launch.package, launch.capabilities);
+    // A package SID puts the process into an AppContainer; without one it runs
+    // on the user's own token and the attribute is left off entirely.
+    let capabilities = launch
+        .package
+        .map(|package| SecurityCapabilities::new(package, launch.capabilities));
     let job_handle = HANDLE(job.as_raw_handle());
 
-    let mut attributes = AttributeList::new(2 + u32::from(!inherited.is_empty()))?;
-    attributes.set(
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-        (&raw const capabilities.value).cast(),
-        size_of::<SECURITY_CAPABILITIES>(),
+    let mut attributes = AttributeList::new(
+        1 + u32::from(capabilities.is_some()) + u32::from(!inherited.is_empty()),
     )?;
+    if let Some(capabilities) = &capabilities {
+        attributes.set(
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            (&raw const capabilities.value).cast(),
+            size_of::<SECURITY_CAPABILITIES>(),
+        )?;
+    }
     attributes.set(
         PROC_THREAD_ATTRIBUTE_JOB_LIST,
         (&raw const job_handle).cast(),

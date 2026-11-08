@@ -282,8 +282,9 @@ impl<N: NetworkPolicy> Sandbox<N> {
         config_data.set_attribution(attribution.paths().clone());
 
         // DenyAll needs no proxy: the backend denies outbound traffic outright,
-        // which is a stronger guarantee than a userspace rejection.
-        let proxy = if N::DENIES_ALL {
+        // which is a stronger guarantee than a userspace rejection. HostAccess
+        // needs none either: the process reaches the network directly.
+        let proxy = if N::DENIES_ALL || N::HOST_ACCESS {
             None
         } else {
             Some(NetworkProxy::new(policy, executor.clone()).await?)
@@ -336,22 +337,30 @@ impl<N: NetworkPolicy> Sandbox<N> {
             // The endpoint is a named pipe — a kernel object whose access control
             // list names nothing an AppContainer token carries — so the pipe must
             // be opened to this sandbox's container once the server has bound it.
-            // The other transports reach it through the filesystem grants.
+            // The other transports reach it through the filesystem grants. Host
+            // access runs on the user's own token, which reaches the pipe as it
+            // is, so it needs no grant.
             #[cfg(windows)]
-            if let Some(socket) = backend_config.ipc_socket() {
+            if !N::HOST_ACCESS
+                && let Some(socket) = backend_config.ipc_socket()
+            {
                 backend.grant_ipc_endpoint(socket)?;
             }
             Ok::<_, crate::Error>(backend)
         })
         .await?;
 
-        match &proxy {
-            Some(proxy) => tracing::info!(
+        match (&proxy, N::HOST_ACCESS) {
+            (Some(proxy), _) => tracing::info!(
                 proxy = %proxy.addr(),
                 working_dir = %working_dir.path().display(),
                 "sandbox created"
             ),
-            None => tracing::info!(
+            (None, true) => tracing::info!(
+                working_dir = %working_dir.path().display(),
+                "sandbox created (host access)"
+            ),
+            (None, false) => tracing::info!(
                 working_dir = %working_dir.path().display(),
                 "sandbox created (network denied)"
             ),
@@ -421,8 +430,8 @@ impl<N: NetworkPolicy> Sandbox<N> {
 
     /// The proxy URL for `HTTP_PROXY`/`HTTPS_PROXY`, when network access is on.
     ///
-    /// Returns `None` under a deny-all policy, where there is no proxy to point
-    /// at rather than an empty address.
+    /// Returns `None` under a deny-all policy and under host access, where
+    /// there is no proxy to point at rather than an empty address.
     pub fn proxy_url(&self) -> Option<String> {
         self.proxy.as_ref().map(NetworkProxy::proxy_url)
     }
