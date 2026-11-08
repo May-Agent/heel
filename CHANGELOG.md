@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/May-Agent/heel/compare/heel-v0.9.0...heel-v0.9.1) - 2026-11-08
+
+### Added
+
+- *(sandbox)* host-access mode with the user's full access, keeping IPC and tracking
+
+### Fixed
+
+- *(sandbox)* wrap the Linux ruleset in Some outside host access
+
 ## [0.9.0](https://github.com/May-Agent/heel/compare/heel-v0.8.0...heel-v0.9.0) - 2026-11-06
 
 ### Fixed
