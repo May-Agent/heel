@@ -113,7 +113,7 @@ impl LinuxBackend {
         tracing::info!(%kernel, broker = broker.is_some(), "Linux sandbox backend initialized");
         Ok(Self {
             broker,
-            ruleset,
+            ruleset: Some(ruleset),
             sink,
         })
     }
