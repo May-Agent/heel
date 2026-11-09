@@ -327,6 +327,9 @@ struct SandboxProfile {
     python_venv: Option<VenvRules>,
     writable_file_system: bool,
     filesystem_strict: bool,
+    /// The escaped path of the `xcrun` shim's cache in the host's per-user
+    /// temporary directory.
+    xcrun_db: String,
     // Security protection flags
     protect_user_home: bool,
     allow_tcc_prompts: bool,
@@ -476,6 +479,7 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
             .transpose()?,
         writable_file_system: config.writable_file_system(),
         filesystem_strict: config.filesystem_strict(),
+        xcrun_db: escape_path(&user_temp_dir()?.join("xcrun_db"))?,
         protect_user_home: security.protect_user_home(),
         allow_tcc_prompts: security.allow_tcc_prompts(),
         allow_gpu: security.allow_gpu(),
@@ -554,6 +558,29 @@ fn openings(config: &SandboxConfigData, grants: &[GrantRules]) -> Result<Opening
         granted.push(subpath(python.venv().path(), python.allow_pip_install())?);
     }
     Openings::new(granted)
+}
+
+/// The host's per-user temporary directory, resolved as the kernel sees it.
+///
+/// A sandboxed process cannot ask for it itself, so the profile names it.
+fn user_temp_dir() -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buffer = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `buffer` is writable for the length passed.
+    let length = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if length == 0 || length > buffer.len() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // The count includes the terminating NUL.
+    let dir = Path::new(std::ffi::OsStr::from_bytes(&buffer[..length - 1]));
+    Ok(std::fs::canonicalize(dir)?)
 }
 
 /// Verify a granted path and escape it for an SBPL string literal.
