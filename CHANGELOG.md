@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3](https://github.com/May-Agent/heel/compare/heel-v0.9.2...heel-v0.9.3) - 2026-11-09
+
+### Fixed
+
+- retry the version check while a freshly written binary is busy
+
 ## [0.9.2](https://github.com/May-Agent/heel/compare/heel-v0.9.1...heel-v0.9.2) - 2026-11-09
 
 ### Fixed
