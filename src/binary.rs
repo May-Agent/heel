@@ -86,16 +86,18 @@ impl AsRef<Path> for HeelBinary {
 /// Compare the version `path --version` prints (`heel <version>`) with this
 /// library's.
 fn check_version(path: &Path) -> Result<()> {
-    let output = std::process::Command::new(path)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| {
-            Error::InitFailed(format!(
-                "cannot run `{} --version` to check the heel binary: {error}",
-                path.display()
-            ))
-        })?;
+    let output = retry_busy(|| {
+        std::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output()
+    })
+    .map_err(|error| {
+        Error::InitFailed(format!(
+            "cannot run `{} --version` to check the heel binary: {error}",
+            path.display()
+        ))
+    })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let binary = output
         .status
@@ -117,6 +119,33 @@ fn check_version(path: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Waits between attempts to run a binary that is still busy.
+const BUSY_BACKOFF: [std::time::Duration; 5] = [
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(20),
+    std::time::Duration::from_millis(40),
+    std::time::Duration::from_millis(80),
+    std::time::Duration::from_millis(160),
+];
+
+/// Runs `attempt`, which executes a binary its caller may have just written.
+///
+/// A child forked by another thread while the file was open for writing holds
+/// the write descriptor until it execs, and executing the file meanwhile fails
+/// with `ETXTBSY`. That failure is retried with a short bounded backoff; any
+/// other result, or a file still busy afterwards, is returned unchanged.
+fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    for delay in BUSY_BACKOFF {
+        match attempt() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(delay);
+            }
+            result => return result,
+        }
+    }
+    attempt()
 }
 
 /// Find an executable by name on `PATH`.
@@ -178,6 +207,55 @@ mod tests {
             HeelBinary::verify(&path),
             Err(Error::InitFailed(_))
         ));
+    }
+
+    fn busy() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy)
+    }
+
+    #[test]
+    fn a_busy_binary_is_run_again_once_it_is_free() {
+        let mut attempts = 0;
+        let result = retry_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(busy())
+            } else {
+                Ok(attempts)
+            }
+        });
+
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[test]
+    fn a_binary_still_busy_after_the_backoff_returns_the_error() {
+        let mut attempts = 0;
+        let result: std::io::Result<()> = retry_busy(|| {
+            attempts += 1;
+            Err(busy())
+        });
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+        assert_eq!(attempts, BUSY_BACKOFF.len() + 1);
+    }
+
+    #[test]
+    fn any_other_failure_is_returned_at_once() {
+        let mut attempts = 0;
+        let result: std::io::Result<()> = retry_busy(|| {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(attempts, 1);
     }
 
     #[test]
