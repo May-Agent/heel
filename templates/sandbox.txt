@@ -28,7 +28,8 @@
 
 ; --- Mach IPC: minimal services required for process execution ---
 (allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))  ; User/group lookups
-(allow mach-lookup (global-name "com.apple.system.logger"))                   ; Unified logging
+(allow mach-lookup (global-name "com.apple.system.opendirectoryd.membership")) ; Per-user temp dir lookup (confstr)
+(allow mach-lookup (global-name "com.apple.system.logger"))                  ; Unified logging
 (allow mach-lookup (global-name "com.apple.system.notification_center"))      ; Notifications
 
 ; Security and code signing
@@ -180,6 +181,9 @@
 (deny file-read* (subpath "/private/var/root") {{ audit }})
 (deny file-read* (subpath "/private/tmp") {{ audit }})
 (deny file-read* (subpath "/private/var/folders") {{ audit }})
+; Xcode's xcrun shim, which the developer-tool stubs in /usr/bin run through,
+; keeps its SDK cache here; without it every start repeats a slow lookup.
+(allow file-read* (literal "{{ xcrun_db }}"))
 {% endif %}
 {% if protect_user_home %}
 {% if allow_tcc_prompts %}
