@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/May-Agent/heel/compare/heel-v0.9.1...heel-v0.9.2) - 2026-11-09
+
+### Fixed
+
+- keep the per-user temp dir reachable so the xcrun shim finds its cache
+
 ## [0.9.1](https://github.com/May-Agent/heel/compare/heel-v0.9.0...heel-v0.9.1) - 2026-11-08
 
 ### Added
