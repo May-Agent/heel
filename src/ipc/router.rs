@@ -42,11 +42,68 @@ fn is_valid_identifier(value: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
-fn assert_valid_identifier(kind: &str, value: &str) {
-    assert!(
-        is_valid_identifier(value),
-        "invalid IPC {kind} '{value}': expected [A-Za-z][A-Za-z0-9_-]*"
-    );
+fn check_identifier(kind: &str, value: &str) -> Result<(), String> {
+    if is_valid_identifier(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid IPC {kind} '{value}': expected [A-Za-z][A-Za-z0-9_-]*"
+        ))
+    }
+}
+
+/// Check that `name` and `meta` describe a command a shim can be written for.
+fn check_command(name: &str, meta: &CommandMeta) -> Result<(), String> {
+    check_identifier("command name", name)?;
+    if name == "heel" {
+        return Err("heel is reserved for the IPC launcher".to_owned());
+    }
+    for arg in meta.positional_args.iter() {
+        check_identifier("positional argument name", arg)?;
+    }
+    if let Some(arg) = &meta.stdin_arg {
+        check_identifier("stdin argument name", arg)?;
+    }
+    if meta.raw_args && !meta.positional_args.is_empty() {
+        return Err(format!(
+            "IPC command '{name}' cannot declare positional arguments with raw_args"
+        ));
+    }
+    Ok(())
+}
+
+/// The commands a router serves, each with how its arguments may be written.
+///
+/// A sandbox's command shims are written from this. It serializes as a map
+/// from command name to [`CommandMeta`], so a process that serves a router can
+/// hand its commands to a `heel` running elsewhere — `heel shims` inside a
+/// container — as one value. Deserializing checks every name and argument the
+/// way [`IpcRouter::register`] does, so a value of this type always describes
+/// shims that can be written.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct IpcCommands(BTreeMap<Cow<'static, str>, CommandMeta>);
+
+impl IpcCommands {
+    /// The commands and how their arguments may be written, by name.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &CommandMeta)> {
+        self.0.iter().map(|(name, meta)| (name.as_ref(), meta))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for IpcCommands {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let commands = BTreeMap::<String, CommandMeta>::deserialize(deserializer)?;
+        for (name, meta) in &commands {
+            check_command(name, meta).map_err(serde::de::Error::custom)?;
+        }
+        Ok(Self(
+            commands
+                .into_iter()
+                .map(|(name, meta)| (Cow::Owned(name), meta))
+                .collect(),
+        ))
+    }
 }
 
 /// Routes IPC requests to registered [`IpcCommand`] handlers.
@@ -55,7 +112,7 @@ fn assert_valid_identifier(kind: &str, value: &str) {
 #[derive(Default)]
 pub struct IpcRouter {
     handlers: BTreeMap<Cow<'static, str>, ErasedHandler>,
-    metadata: BTreeMap<Cow<'static, str>, CommandMeta>,
+    commands: IpcCommands,
 }
 
 impl IpcRouter {
@@ -77,28 +134,17 @@ impl IpcRouter {
     /// produce a broken wrapper script inside the sandbox.
     pub fn register<C: IpcCommand>(mut self, command: C) -> Self {
         let name = command.name();
-        let positional_args = command.positional_args();
-        let stdin_arg = command.stdin_arg();
-
-        assert_valid_identifier("command name", &name);
-        assert!(
-            name.as_ref() != "heel",
-            "heel is reserved for the IPC launcher"
-        );
-        for arg in positional_args.iter() {
-            assert_valid_identifier("positional argument name", arg);
-        }
-        if let Some(arg) = &stdin_arg {
-            assert_valid_identifier("stdin argument name", arg);
+        let meta = CommandMeta {
+            positional_args: command.positional_args(),
+            stdin_arg: command.stdin_arg(),
+            raw_args: command.raw_args(),
+        };
+        if let Err(message) = check_command(&name, &meta) {
+            panic!("{message}");
         }
         assert!(
             !self.handlers.contains_key(&name),
             "IPC command '{name}' is already registered"
-        );
-        let raw_args = command.raw_args();
-        assert!(
-            !raw_args || positional_args.is_empty(),
-            "IPC command '{name}' cannot declare positional arguments with raw_args"
         );
 
         let command = Arc::new(command);
@@ -111,14 +157,7 @@ impl IpcRouter {
             })
         });
 
-        self.metadata.insert(
-            name.clone(),
-            CommandMeta {
-                positional_args,
-                stdin_arg,
-                raw_args,
-            },
-        );
+        self.commands.0.insert(name.clone(), meta);
         self.handlers.insert(name, handler);
         self
     }
@@ -140,16 +179,19 @@ impl IpcRouter {
 
     /// The registered commands and how their arguments may be written.
     pub fn methods(&self) -> impl Iterator<Item = (&str, &CommandMeta)> {
-        self.metadata
-            .iter()
-            .map(|(name, meta)| (name.as_ref(), meta))
+        self.commands.iter()
+    }
+
+    /// The registered commands, as the value their shims are written from.
+    pub fn commands(&self) -> &IpcCommands {
+        &self.commands
     }
 }
 
 impl std::fmt::Debug for IpcRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IpcRouter")
-            .field("commands", &self.metadata.keys().collect::<Vec<_>>())
+            .field("commands", &self.commands.0.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -392,5 +434,45 @@ mod tests {
     #[should_panic(expected = "already registered")]
     fn duplicate_registration_is_rejected() {
         let _ = IpcRouter::new().register(Doubler).register(Doubler);
+    }
+
+    #[test]
+    fn commands_survive_serialization() {
+        let router = IpcRouter::new().register(Doubler).register(Tool);
+        let text = serde_json::to_string(router.commands()).unwrap();
+        let commands: IpcCommands = serde_json::from_str(&text).unwrap();
+        assert_eq!(&commands, router.commands());
+    }
+
+    #[test]
+    fn deserialized_commands_are_checked_like_registered_ones() {
+        for (text, expected) in [
+            (
+                r#"{"bad/name":{"positional_args":[],"stdin_arg":null}}"#,
+                "invalid IPC command name 'bad/name'",
+            ),
+            (
+                r#"{"heel":{"positional_args":[],"stdin_arg":null}}"#,
+                "heel is reserved for the IPC launcher",
+            ),
+            (
+                r#"{"search":{"positional_args":["$(id)"],"stdin_arg":null}}"#,
+                "invalid IPC positional argument name '$(id)'",
+            ),
+            (
+                r#"{"search":{"positional_args":[],"stdin_arg":"a b"}}"#,
+                "invalid IPC stdin argument name 'a b'",
+            ),
+            (
+                r#"{"both":{"positional_args":["query"],"stdin_arg":null,"raw_args":true}}"#,
+                "cannot declare positional arguments with raw_args",
+            ),
+        ] {
+            let error = serde_json::from_str::<IpcCommands>(text).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{text}: unexpected error {error}"
+            );
+        }
     }
 }
