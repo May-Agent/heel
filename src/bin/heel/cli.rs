@@ -23,6 +23,7 @@ impl Cli {
             Commands::Shell(args) => args.common.verbose,
             Commands::Python(args) => args.common.verbose,
             Commands::Ipc(args) => args.verbose,
+            Commands::Shims(args) => args.verbose,
             #[cfg(target_os = "linux")]
             Commands::Supervise(_) => false,
         }
@@ -42,6 +43,9 @@ pub enum Commands {
 
     /// Invoke a host IPC command from inside a sandbox.
     Ipc(IpcArgs),
+
+    /// Write the shims of IPC commands served elsewhere into a directory.
+    Shims(ShimsArgs),
 
     /// Run a command as the root of its process tree and own that tree.
     ///
@@ -158,6 +162,32 @@ impl PythonArgs {
     pub fn args(&self) -> &[String] {
         self.command.get(1..).unwrap_or_default()
     }
+}
+
+/// Write IPC command shims for a process that runs where the router does not.
+///
+/// A container reaching its host's router writes them with this before running
+/// the process: the directory then holds one program per command and a `heel`
+/// launcher for this binary, and with it on `PATH` and `HEEL_IPC_ENDPOINT`
+/// naming the router (`tcp://host:port`), or a sandbox's relay of it, the
+/// commands run as they do in a sandbox on the host.
+#[derive(Args)]
+pub struct ShimsArgs {
+    /// Directory to write the shims into, created owner-only if missing.
+    #[arg(long)]
+    pub dir: PathBuf,
+
+    /// The commands, as the JSON serialization of `heel::ipc::IpcCommands`.
+    #[arg(long, value_parser = parse_ipc_commands)]
+    pub commands: heel::ipc::IpcCommands,
+
+    /// Enable verbose output.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+fn parse_ipc_commands(value: &str) -> Result<heel::ipc::IpcCommands, serde_json::Error> {
+    serde_json::from_str(value)
 }
 
 /// Invoke a host command over the sandbox IPC socket.

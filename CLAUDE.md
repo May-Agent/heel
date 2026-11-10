@@ -18,7 +18,7 @@ Platform support:
 ```
 .
 ├── Cargo.toml       # Library package and `heel` CLI binary
-├── src/bin/heel/    # CLI sources: `heel run`, `heel shell`, `heel python`, `heel ipc`
+├── src/bin/heel/    # CLI sources: `heel run`, `heel shell`, `heel python`, `heel ipc`, `heel shims`
 ├── src/ipc/         # IPC: command trait, router, transport, command shims
 ├── src/platform/    # Per-platform backends behind the `Backend` trait
 ├── templates/       # Askama templates: the SBPL profile and the command shims
@@ -104,7 +104,7 @@ user. Never merge it automatically, and never hand-edit `version =` or
 
 - **SecurityConfig** (`src/security.rs`) - Fine-grained protection toggles (protect_user_home, protect_credentials, protect_cloud_config, etc.) and hardware access flags (allow_gpu, allow_npu, allow_hardware).
 
-- **IpcRouter** (`src/ipc/`) - Type-safe IPC over a Unix domain socket with MessagePack. Commands implement `IpcCommand`, whose name and argument shape are associated constants and whose per-request data is a separate `Args` type. Sandboxed processes see each command as a shim on `PATH` that execs `heel ipc`; all argument parsing happens there, in Rust.
+- **IpcRouter** (`src/ipc/`) - Type-safe IPC over a Unix domain socket with MessagePack. Commands implement `IpcCommand`, whose name and argument shape are associated constants and whose per-request data is a separate `Args` type. Sandboxed processes see each command as a shim on `PATH` that execs `heel ipc`; all argument parsing happens there, in Rust. A process that runs where the router does not (a container reaching its host over `tcp://`) gets the same shims from `heel shims`, which writes them from a serialized `IpcCommands` through the same writer.
 
 ### Key Patterns
 

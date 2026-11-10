@@ -1,7 +1,8 @@
 //! Generation of the command shims a sandboxed process sees on its `PATH`.
 //!
-//! Each registered IPC command gets a small script in `.heel/bin` that execs
-//! `heel ipc <command>`. The scripts carry no argument-parsing logic of their
+//! Each registered IPC command gets a small script that execs
+//! `heel ipc <command>`: in a sandbox's `.heel/bin`, or in the directory
+//! [`IpcCommands::write_shims`] is given. The scripts carry no argument-parsing logic of their
 //! own: they forward the declared argument names to `heel ipc`, which does the
 //! parsing in Rust where it can be tested.
 
@@ -12,8 +13,9 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use askama::Template;
 
+use crate::binary::HeelBinary;
 use crate::error::{Error, Result};
-use crate::ipc::router::{CommandMeta, IpcRouter};
+use crate::ipc::router::{CommandMeta, IpcCommands};
 
 /// Directory inside the working directory holding sandbox-private files.
 pub const HEEL_DIR_NAME: &str = ".heel";
@@ -72,39 +74,62 @@ impl IpcLayout {
     /// Create the directories and write the launcher and command shims.
     ///
     /// This is blocking work; callers run it off the async executor.
-    pub(crate) fn write(&self, router: &IpcRouter, heel_binary: &Path) -> Result<()> {
+    pub(crate) fn write(&self, commands: &IpcCommands, heel_binary: &Path) -> Result<()> {
         create_private_dir(&self.heel_dir)?;
-        create_private_dir(&self.bin_dir)?;
-
-        #[cfg(unix)]
-        {
-            let escaped = shell_escape::unix::escape(heel_binary.to_string_lossy());
-            write_script(
-                &self.bin_dir.join("heel"),
-                &LauncherTemplate { binary: &escaped }.render()?,
-            )?;
-            for (command, meta) in router.methods() {
-                write_script(&self.bin_dir.join(command), &render_wrapper(command, meta)?)?;
-            }
-        }
-        #[cfg(windows)]
-        {
-            let binary = self.bin_dir.join("heel.exe");
-            std::fs::copy(heel_binary, &binary).map_err(|source| Error::path(&binary, source))?;
-            for (command, meta) in router.methods() {
-                let executable = self.bin_dir.join(command).with_extension("exe");
-                std::fs::hard_link(&binary, &executable)
-                    .map_err(|source| Error::path(&executable, source))?;
-                let metadata = self.bin_dir.join(command).with_extension("json");
-                let contents = render_wrapper(command, meta)?;
-                std::fs::write(&metadata, contents)
-                    .map_err(|source| Error::path(&metadata, source))?;
-            }
-        }
-
-        tracing::debug!(bin_dir = %self.bin_dir.display(), "wrote IPC command shims");
-        Ok(())
+        write_shims(&self.bin_dir, commands, heel_binary)
     }
+}
+
+impl IpcCommands {
+    /// Write the shims of these commands into `dir`, which is created
+    /// owner-only if it does not exist.
+    ///
+    /// `dir` then holds what a sandbox's shim directory holds: a `heel`
+    /// launcher that runs `heel`, and one program per command that runs
+    /// `heel ipc` with the command's declared arguments. Put on `PATH`, the
+    /// commands are ordinary programs that reach the endpoint
+    /// `HEEL_IPC_ENDPOINT` names. This is for a process that runs where the
+    /// router does not, such as a container reaching the router's host
+    /// through `tcp://`; a sandbox with a router writes its own shims.
+    ///
+    /// This is blocking work; run it off the async executor.
+    pub fn write_shims(&self, dir: &Path, heel_binary: &HeelBinary) -> Result<()> {
+        write_shims(dir, self, heel_binary.as_path())
+    }
+}
+
+/// Create `bin_dir` and write the launcher for `heel_binary` and the shims of
+/// `commands` into it.
+fn write_shims(bin_dir: &Path, commands: &IpcCommands, heel_binary: &Path) -> Result<()> {
+    create_private_dir(bin_dir)?;
+
+    #[cfg(unix)]
+    {
+        let escaped = shell_escape::unix::escape(heel_binary.to_string_lossy());
+        write_script(
+            &bin_dir.join("heel"),
+            &LauncherTemplate { binary: &escaped }.render()?,
+        )?;
+        for (command, meta) in commands.iter() {
+            write_script(&bin_dir.join(command), &render_wrapper(command, meta)?)?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let binary = bin_dir.join("heel.exe");
+        std::fs::copy(heel_binary, &binary).map_err(|source| Error::path(&binary, source))?;
+        for (command, meta) in commands.iter() {
+            let executable = bin_dir.join(command).with_extension("exe");
+            std::fs::hard_link(&binary, &executable)
+                .map_err(|source| Error::path(&executable, source))?;
+            let metadata = bin_dir.join(command).with_extension("json");
+            let contents = render_wrapper(command, meta)?;
+            std::fs::write(&metadata, contents).map_err(|source| Error::path(&metadata, source))?;
+        }
+    }
+
+    tracing::debug!(bin_dir = %bin_dir.display(), "wrote IPC command shims");
+    Ok(())
 }
 
 /// The directory to create the IPC socket in.
@@ -172,7 +197,7 @@ fn write_script(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{IpcCommand, IpcContext, NoArgs};
+    use crate::ipc::{IpcCommand, IpcContext, IpcRouter, NoArgs};
     use serde::Deserialize;
 
     struct Search;
@@ -310,7 +335,7 @@ mod tests {
         let binary = PathBuf::from("/usr/local/bin/heel");
         #[cfg(windows)]
         let binary = std::env::current_exe().expect("native test executable");
-        layout.write(&router, &binary).expect("writes");
+        layout.write(router.commands(), &binary).expect("writes");
 
         #[cfg(unix)]
         let names = ["heel", "search", "plain"];
@@ -352,7 +377,7 @@ mod tests {
         #[cfg(unix)]
         {
             layout
-                .write(&IpcRouter::new(), Path::new("/opt/heel dir/heel"))
+                .write(&IpcCommands::default(), Path::new("/opt/heel dir/heel"))
                 .expect("writes");
             let launcher = std::fs::read_to_string(layout.bin_dir().join("heel")).expect("reads");
             assert!(
@@ -367,7 +392,9 @@ mod tests {
             let binary = source.join("heel.exe");
             std::fs::copy(std::env::current_exe().expect("native binary"), &binary)
                 .expect("copies");
-            layout.write(&IpcRouter::new(), &binary).expect("writes");
+            layout
+                .write(&IpcCommands::default(), &binary)
+                .expect("writes");
             assert_eq!(
                 std::fs::read(&binary).expect("source"),
                 std::fs::read(layout.bin_dir().join("heel.exe")).expect("native launcher")

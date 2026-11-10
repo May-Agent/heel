@@ -402,7 +402,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
             move || -> Result<(crate::ipc::IpcRouter, WorkingDir, PathBuf, PathBuf)> {
                 let (socket_dir, socket) = create_ipc_socket_dir()?;
                 let layout = IpcLayout::new(socket_dir.path());
-                layout.write(&router, &write_binary)?;
+                layout.write(router.commands(), &write_binary)?;
                 let bin_dir = layout.bin_dir().to_path_buf();
                 Ok((router, socket_dir, bin_dir, socket))
             },
