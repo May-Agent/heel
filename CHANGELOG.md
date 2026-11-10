@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4](https://github.com/May-Agent/heel/compare/heel-v0.9.3...heel-v0.9.4) - 2026-11-10
+
+### Fixed
+
+- answer a panicking IPC handler's request with an error instead of dropping the connection
+
 ## [0.9.3](https://github.com/May-Agent/heel/compare/heel-v0.9.2...heel-v0.9.3) - 2026-11-09
 
 ### Fixed
