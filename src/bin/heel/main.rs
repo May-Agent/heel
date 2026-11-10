@@ -93,6 +93,7 @@ async fn run(cli: Cli) -> CliResult<i32> {
             let config = configure(&args.common)?;
             commands::python::execute(args, config).await
         }
+        Commands::Shims(args) => commands::shims::execute(args).await.map(|()| 0),
         Commands::Ipc(_) => unreachable!("handled above"),
         #[cfg(target_os = "linux")]
         Commands::Supervise(_) => unreachable!("handled in main"),

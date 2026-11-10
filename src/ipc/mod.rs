@@ -63,7 +63,7 @@ mod wrappers;
 pub use client::IpcClient;
 pub use command::{IpcCommand, IpcContext, NoArgs};
 pub use protocol::{IpcError, IpcRequest, IpcResponse};
-pub use router::{CommandMeta, IpcRouter};
+pub use router::{CommandMeta, IpcCommands, IpcRouter};
 pub use tcp::TcpIpcEndpoint;
 pub use wrappers::{HEEL_DIR_NAME, SOCKET_NAME, WRAPPER_DIR_NAME};
 
