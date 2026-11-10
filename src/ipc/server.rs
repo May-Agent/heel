@@ -13,12 +13,15 @@
 //! pool so the executor thread is never occupied by a syscall. Request
 //! *handling* stays async: a handler may await freely.
 
+use std::any::Any;
 use std::io::{self, Read, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blocking::unblock;
 use executor_core::{Executor, Task};
+use futures_lite::FutureExt as _;
 use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use interprocess::local_socket::{ListenerOptions, Stream};
 
@@ -255,14 +258,26 @@ async fn handle_connection<D: IpcDispatcher>(stream: Stream, router: Arc<D>) {
             Ok(request) => {
                 tracing::debug!(method = %request.method, "handling IPC request");
                 let context = IpcContext::new(request.working_dir);
-                match router
-                    .handle(&request.method, context, request.params)
-                    .await
-                {
-                    Ok(payload) => IpcResponse::success(payload),
-                    Err(error) => {
+                // A handler that panics would otherwise end this task and drop
+                // the stream mid-request, leaving the client with a short read
+                // and no word of what failed on the host.
+                let outcome =
+                    AssertUnwindSafe(router.handle(&request.method, context, request.params))
+                        .catch_unwind()
+                        .await;
+                match outcome {
+                    Ok(Ok(payload)) => IpcResponse::success(payload),
+                    Ok(Err(error)) => {
                         tracing::warn!(%error, "IPC handler error");
                         IpcResponse::error(&error.to_string())
+                    }
+                    Err(panic) => {
+                        let message = panic_message(panic.as_ref());
+                        tracing::error!(method = %request.method, %message, "IPC handler panicked");
+                        IpcResponse::error(&format!(
+                            "the host panicked while handling `{}`: {message}",
+                            request.method
+                        ))
                     }
                 }
             }
@@ -288,12 +303,36 @@ async fn handle_connection<D: IpcDispatcher>(stream: Stream, router: Arc<D>) {
     }
 }
 
+/// The message a panic was raised with.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic without a message")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ipc::IpcCommand;
     use serde::Deserialize;
     use std::borrow::Cow;
+
+    struct Panics;
+
+    impl IpcCommand for Panics {
+        fn name(&self) -> Cow<'static, str> {
+            "panics".into()
+        }
+
+        type Args = EchoArgs;
+        type Response = String;
+
+        async fn handle(&self, args: EchoArgs, _context: IpcContext) -> Result<String, IpcError> {
+            panic!("index out of bounds: {}", args.message);
+        }
+    }
 
     struct Echo;
 
@@ -318,6 +357,11 @@ mod tests {
     /// Issue one request over a fresh connection, synchronously.
     fn round_trip(socket: &Path, method: &str, params: &[u8]) -> IpcResponse {
         let mut stream = Stream::connect(endpoint::name(socket).expect("names")).expect("connects");
+        request(&mut stream, method, params)
+    }
+
+    /// Issue one request over `stream`, synchronously.
+    fn request(stream: &mut Stream, method: &str, params: &[u8]) -> IpcResponse {
         let frame = IpcRequest::encode(method, Path::new("/"), params).expect("encodes");
         stream.write_all(&frame).expect("writes");
         stream.flush().expect("flushes");
@@ -416,5 +460,45 @@ mod tests {
         assert!(!response.success);
         let message: String = rmp_serde::from_slice(&response.payload).unwrap();
         assert!(message.contains("unknown method"), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_answers_with_an_error_and_keeps_the_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("ipc.sock");
+
+        let server = IpcServer::new(
+            socket.clone(),
+            IpcRouter::new().register(Panics).register(Echo),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("server starts");
+
+        let params =
+            rmp_serde::to_vec_named(&serde_json::json!({ "message": "9" })).expect("encodes");
+        let socket = server.socket_path().to_path_buf();
+        let (panicked, echoed) = tokio::task::spawn_blocking(move || {
+            let mut stream =
+                Stream::connect(endpoint::name(&socket).expect("names")).expect("connects");
+            let panicked = request(&mut stream, "panics", &params);
+            let echoed = request(&mut stream, "echo", &params);
+            (panicked, echoed)
+        })
+        .await
+        .expect("client task completes");
+
+        assert!(!panicked.success);
+        let message: String = rmp_serde::from_slice(&panicked.payload).unwrap();
+        assert!(
+            message.contains("panicked while handling `panics`")
+                && message.contains("index out of bounds: 9"),
+            "got: {message}"
+        );
+        assert!(echoed.success);
+        assert_eq!(
+            rmp_serde::from_slice::<String>(&echoed.payload).unwrap(),
+            "9"
+        );
     }
 }
