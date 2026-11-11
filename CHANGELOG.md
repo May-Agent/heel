@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/May-Agent/heel/compare/heel-v0.9.7...heel-v0.10.0) - 2026-11-11
+
+### Added
+
+- [**breaking**] ship the IPC client as heel-shim, embedded by the library
+
+### Fixed
+
+- *(linux)* serve the sandbox's files from descriptor tables of the broker's own
+
+### Other
+
+- approve the release PR's held runs instead of dispatching CI
+- *(linux)* give the subreaper call its safety comment
+- *(linux)* adopt the descendant the sandbox leaves behind
+- *(linux)* record where a descendant is at each step of the drop
+- leave the release PR's merge to a person
+- make main the single trunk and report through CI result
+- *(linux)* tolerate inherited descriptors and say where a lost descendant is
+- lint Windows and aarch64 Linux on runners of their own target
+
 ## [0.9.7](https://github.com/May-Agent/heel/compare/heel-v0.9.6...heel-v0.9.7) - 2026-11-11
 
 ### Added
