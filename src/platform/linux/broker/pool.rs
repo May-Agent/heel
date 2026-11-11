@@ -12,6 +12,16 @@
 //! The pool lives on the same filesystem as the directories it serves, because a
 //! rename cannot cross one. Nothing the sandbox does may reach it: the guard
 //! refuses every operation inside a pool directory.
+//!
+//! The pool is made in two halves, on two threads of different descriptor tables
+//! (see [`super::table`]). [`Pool::prepare`] runs on the setup thread, which
+//! lists and opens user directories: it clears stale pools, creates this pool's
+//! directories and its entries, and returns a [`PoolPlan`], which holds only
+//! names and paths and owns the removal of what was created until the pool takes
+//! over, and one descriptor per directory, which cross to the thread that serves
+//! the pool. The sandbox's Landlock rules for the entries are added from the plan
+//! by the thread that builds the ruleset. [`Pool::from_parts`] runs on the
+//! serving thread and gives the pool its descriptors.
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -23,6 +33,7 @@ use landlock::{AccessFs, BitFlags};
 use rustix::fs::{CWD, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 
+use super::diag::Diagnostic;
 use crate::config::InodePool;
 use crate::error::{Error, Result};
 use crate::platform::linux::landlock_rules::Ancestor;
@@ -47,6 +58,75 @@ struct Group {
     members: Vec<PathBuf>,
     files: Mutex<Vec<String>>,
     directories: Mutex<Vec<String>>,
+}
+
+/// What the setup thread made for one filesystem.
+#[derive(Debug)]
+struct GroupPlan {
+    directory: PathBuf,
+    /// The rights every entry's rule carries.
+    rights: BitFlags<AccessFs>,
+    members: Vec<PathBuf>,
+    files: Vec<String>,
+    directories: Vec<String>,
+}
+
+/// A pool as the setup thread left it: paths and names, no descriptor.
+///
+/// Dropping it removes the directories it made, so a start that fails after the
+/// pool was made leaves nothing behind. [`Pool::from_parts`] takes them over.
+#[derive(Debug)]
+pub(crate) struct PoolPlan {
+    groups: Vec<GroupPlan>,
+    capacity: InodePool,
+}
+
+impl PoolPlan {
+    /// Whether no filesystem had a place for the pool.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// The directories the pool lives in.
+    pub(crate) fn directories(&self) -> Vec<PathBuf> {
+        self.groups
+            .iter()
+            .map(|group| group.directory.clone())
+            .collect()
+    }
+
+    /// Add the Landlock rule of every entry through `grant`.
+    ///
+    /// `held` are the descriptors [`Pool::prepare`] returned, in its order, as
+    /// they arrived in the calling thread's table. Each entry is opened relative
+    /// to its directory's descriptor, as a path descriptor that closes without
+    /// touching any lock.
+    pub(crate) fn grant(&self, held: &[OwnedFd], grant: &mut Grant<'_>) -> Result<()> {
+        if held.len() != self.groups.len() {
+            return Err(Error::InitFailed(format!(
+                "the inode pool has {} directories and {} descriptors arrived for them",
+                self.groups.len(),
+                held.len()
+            )));
+        }
+        for (group, held) in self.groups.iter().zip(held) {
+            for name in group.files.iter().chain(&group.directories) {
+                grant(
+                    open_entry(held, name, &group.directory)?.as_fd(),
+                    group.rights,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PoolPlan {
+    fn drop(&mut self) {
+        for group in &self.groups {
+            let _ = std::fs::remove_dir_all(&group.directory);
+        }
+    }
 }
 
 /// An inode taken from the pool, to be renamed into place.
@@ -143,28 +223,31 @@ fn cache_directory() -> Option<PathBuf> {
 }
 
 impl Pool {
-    /// Create the pool for `ancestors`.
+    /// Make the pool for `ancestors`: the first half, run on the setup thread.
     ///
-    /// Each entry is opened once and passed to `grant`, which adds its rule to the
-    /// sandbox's own Landlock layer; the descriptor is closed at once, so the pool
-    /// holds one descriptor per group however many entries it has.
-    pub(crate) fn create(
+    /// Returns the plan and one descriptor per group, in the plan's order. The
+    /// descriptors belong to the calling thread's table and go to the thread
+    /// that serves the pool over a socket; they are never returned from the
+    /// thread. What the setup has to say is added to `log`.
+    pub(crate) fn prepare(
         capacity: InodePool,
         ancestors: &[Ancestor],
-        grant: &mut Grant<'_>,
-    ) -> Result<Self> {
+        log: &mut Vec<Diagnostic>,
+    ) -> Result<(PoolPlan, Vec<OwnedFd>)> {
         let cache = cache_directory().and_then(|path| match open_or_create_directory(&path) {
             Ok(root) => {
                 remove_stale(root.as_fd(), "pool-");
                 Some(Cache { path, root })
             }
             Err(errno) => {
-                tracing::warn!(
-                    cache = %path.display(),
-                    %errno,
-                    "broker: the cache directory cannot hold the inode pool (a link stands in \
-                     its path, or it cannot be made); using the filesystems of the protected \
-                     paths instead"
+                log.push(
+                    Diagnostic::warn(
+                        "broker: the cache directory cannot hold the inode pool (a link stands \
+                         in its path, or it cannot be made); using the filesystems of the \
+                         protected paths instead",
+                    )
+                    .field("cache", path.display())
+                    .field("errno", errno),
                 );
                 None
             }
@@ -180,36 +263,73 @@ impl Pool {
                 .push(ancestor);
         }
 
-        let mut pool = Self {
+        let mut plan = PoolPlan {
             groups: Vec::new(),
             capacity,
         };
+        let mut held = Vec::new();
         for ((device, _), members) in keyed {
             let rights = members
                 .iter()
                 .fold(BitFlags::<AccessFs>::empty(), |all, ancestor| {
                     all | ancestor.rights
                 });
-            let Some(directory) = locate(cache.as_ref(), device, &members) else {
-                tracing::debug!(
-                    device,
-                    "broker: no place for an inode pool on this filesystem; new entries in its \
-                     protected directories will fail"
+            let Some(location) = locate(cache.as_ref(), device, &members, log) else {
+                log.push(
+                    Diagnostic::debug(
+                        "broker: no place for an inode pool on this filesystem; new entries in \
+                         its protected directories will fail",
+                    )
+                    .field("device", device),
                 );
                 continue;
             };
-            let group = populate(directory, capacity, rights, grant, &members)?;
-            pool.groups.push(group);
+            // In the plan before it is filled, so that an error while filling
+            // removes what was made.
+            let index = plan.groups.len();
+            plan.groups.push(GroupPlan {
+                directory: location.path,
+                rights,
+                members: members
+                    .iter()
+                    .map(|ancestor| ancestor.path.clone())
+                    .collect(),
+                files: Vec::new(),
+                directories: Vec::new(),
+            });
+            populate(&mut plan.groups[index], &location.held, capacity)?;
+            held.push(location.held);
         }
-        Ok(pool)
+        Ok((plan, held))
     }
 
-    /// The directories the pool lives in.
-    pub(crate) fn directories(&self) -> Vec<PathBuf> {
-        self.groups
-            .iter()
-            .map(|group| group.directory.clone())
-            .collect()
+    /// Take over the pool a plan describes: the second half, run on the thread
+    /// that serves it, with `held` the descriptors [`Pool::prepare`] returned as
+    /// they arrived in its table.
+    pub(crate) fn from_parts(mut plan: PoolPlan, held: Vec<OwnedFd>) -> Result<Self> {
+        if held.len() != plan.groups.len() {
+            return Err(Error::InitFailed(format!(
+                "the inode pool has {} directories and {} descriptors arrived for them",
+                plan.groups.len(),
+                held.len()
+            )));
+        }
+        // Emptied, so the plan's drop removes nothing: the pool's does.
+        let groups = std::mem::take(&mut plan.groups)
+            .into_iter()
+            .zip(held)
+            .map(|(group, held)| Group {
+                directory: group.directory,
+                held,
+                members: group.members,
+                files: Mutex::new(group.files),
+                directories: Mutex::new(group.directories),
+            })
+            .collect();
+        Ok(Self {
+            groups,
+            capacity: plan.capacity,
+        })
     }
 
     /// Take an inode of `kind` for a new entry in `directory`.
@@ -331,7 +451,12 @@ fn open_or_create_directory(path: &Path) -> rustix::io::Result<OwnedFd> {
 /// Where the pool for filesystem `device` lives: the cache directory if that is
 /// on it, otherwise a hidden directory in the shallowest member that can be
 /// written to.
-fn locate(cache: Option<&Cache>, device: u64, members: &[&Ancestor]) -> Option<Location> {
+fn locate(
+    cache: Option<&Cache>,
+    device: u64,
+    members: &[&Ancestor],
+    log: &mut Vec<Diagnostic>,
+) -> Option<Location> {
     if let Some(cache) = cache
         && rustix::fs::fstat(&cache.root).is_ok_and(|stat| stat.st_dev == device)
         && let Some(pool) = create_unique(cache.root.as_fd(), &cache.path, "pool-")
@@ -348,10 +473,12 @@ fn locate(cache: Option<&Cache>, device: u64, members: &[&Ancestor]) -> Option<L
                     return Some(pool);
                 }
             }
-            Err(errno) => tracing::debug!(
-                path = %ancestor.path.display(),
-                %errno,
-                "broker: cannot open a protected path's directory for the inode pool"
+            Err(errno) => log.push(
+                Diagnostic::debug(
+                    "broker: cannot open a protected path's directory for the inode pool",
+                )
+                .field("path", ancestor.path.display())
+                .field("errno", errno),
             ),
         }
     }
@@ -390,49 +517,35 @@ fn create_unique(root: BorrowedFd<'_>, path: &Path, prefix: &str) -> Option<Loca
     None
 }
 
-fn populate(
-    location: Location,
-    capacity: InodePool,
-    rights: BitFlags<AccessFs>,
-    grant: &mut Grant<'_>,
-    members: &[&Ancestor],
-) -> Result<Group> {
-    let Location {
-        path: directory,
-        held,
-    } = location;
-    let entry_error = |name: &str, errno: Errno| Error::path(directory.join(name), errno.into());
+/// Create the entries of `group` in the directory `held` is the descriptor of,
+/// and record their names in it.
+fn populate(group: &mut GroupPlan, held: &OwnedFd, capacity: InodePool) -> Result<()> {
+    let entry_error =
+        |name: &str, errno: Errno| Error::path(group.directory.join(name), errno.into());
 
     let mut files = Vec::with_capacity(capacity.files());
     for number in 0..capacity.files() {
         let name = format!("f{number}");
+        // Created and closed: the inode is heel's own, the exclusive creation
+        // is the point, and the sandbox's rule for it is added from the plan.
         rustix::fs::openat(
-            &held,
+            held,
             &name,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         )
         .map_err(|errno| entry_error(&name, errno))?;
-        grant(open_entry(&held, &name, &directory)?.as_fd(), rights)?;
         files.push(name);
     }
     let mut directories = Vec::with_capacity(capacity.directories());
     for number in 0..capacity.directories() {
         let name = format!("d{number}");
-        rustix::fs::mkdirat(&held, &name, Mode::RWXU).map_err(|errno| entry_error(&name, errno))?;
-        grant(open_entry(&held, &name, &directory)?.as_fd(), rights)?;
+        rustix::fs::mkdirat(held, &name, Mode::RWXU).map_err(|errno| entry_error(&name, errno))?;
         directories.push(name);
     }
-    Ok(Group {
-        directory,
-        held,
-        members: members
-            .iter()
-            .map(|ancestor| ancestor.path.clone())
-            .collect(),
-        files: Mutex::new(files),
-        directories: Mutex::new(directories),
-    })
+    group.files = files;
+    group.directories = directories;
+    Ok(())
 }
 
 /// Open `name` in the pool directory `held` as a path descriptor that follows
@@ -445,4 +558,85 @@ fn open_entry(held: &OwnedFd, name: &str, directory: &Path) -> Result<OwnedFd> {
         Mode::empty(),
     )
     .map_err(|errno| Error::path(directory.join(name), errno.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::linux::landlock_rules::{REQUIRED_ABI, read_rights};
+
+    fn ancestor(path: &Path) -> Ancestor {
+        Ancestor {
+            path: path.to_path_buf(),
+            rights: read_rights(REQUIRED_ABI),
+        }
+    }
+
+    fn prepared(root: &Path) -> (PoolPlan, Vec<OwnedFd>) {
+        let mut log = Vec::new();
+        let made = Pool::prepare(InodePool::new(2, 3), &[ancestor(root)], &mut log).unwrap();
+        assert!(!made.0.is_empty(), "no place was found for the pool");
+        made
+    }
+
+    /// The setup thread's half names what it made, and removes it unless the
+    /// pool took it over, so a start that fails afterwards leaves nothing.
+    #[test]
+    fn a_plan_that_is_dropped_removes_the_directories_it_made() {
+        let root = tempfile::tempdir().unwrap();
+        let (plan, held) = prepared(root.path());
+        let directories = plan.directories();
+        assert_eq!(directories.len(), held.len());
+        assert!(directories.iter().all(|directory| directory.is_dir()));
+        drop(plan);
+        assert!(directories.iter().all(|directory| !directory.exists()));
+    }
+
+    #[test]
+    fn every_entry_of_the_plan_gets_its_rule_from_the_received_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        let (plan, held) = prepared(root.path());
+        let mut granted = Vec::new();
+        plan.grant(&held, &mut |fd, access| {
+            granted.push((rustix::fs::fstat(fd).unwrap().st_mode, access));
+            Ok(())
+        })
+        .unwrap();
+        // Two files and three directories, each with the group's rights.
+        assert_eq!(granted.len(), 5);
+        assert!(
+            granted
+                .iter()
+                .all(|(_, access)| *access == read_rights(REQUIRED_ABI))
+        );
+        let files = granted
+            .iter()
+            .filter(|(mode, _)| mode & libc::S_IFMT == libc::S_IFREG)
+            .count();
+        assert_eq!(files, 2);
+        assert!(plan.grant(&[], &mut |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn a_pool_that_took_over_the_plan_removes_the_directories_when_it_drops() {
+        let root = tempfile::tempdir().unwrap();
+        let (plan, held) = prepared(root.path());
+        let directories = plan.directories();
+        let pool = Pool::from_parts(plan, held).unwrap();
+        assert!(directories.iter().all(|directory| directory.is_dir()));
+        let served = pool.acquire(root.path(), Kind::File).unwrap();
+        assert!(pool.place(&served).1.starts_with('f'));
+        drop(pool);
+        assert!(directories.iter().all(|directory| !directory.exists()));
+    }
+
+    #[test]
+    fn descriptors_that_do_not_match_the_plan_are_refused_and_nothing_is_left() {
+        let root = tempfile::tempdir().unwrap();
+        let (plan, held) = prepared(root.path());
+        let directories = plan.directories();
+        drop(held);
+        assert!(Pool::from_parts(plan, Vec::new()).is_err());
+        assert!(directories.iter().all(|directory| !directory.exists()));
+    }
 }

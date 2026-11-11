@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use rustix::fs::ResolveFlags;
 
-use super::Context;
+use super::home::Context;
 use super::notify::{self, Reply};
 use super::ops::{Call, Errno, Out, refuse};
 use super::resolve::{self, AT_FDCWD, Base};

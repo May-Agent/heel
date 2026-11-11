@@ -10,9 +10,18 @@
 //! Errors are the exact errno of the call that failed, as the sandboxed
 //! process would have seen it. A refusal by the policy is `EACCES`, which is what
 //! Landlock reports for the same access.
+//!
+//! These functions run on workers whose descriptor table is their own (see
+//! [`super::table`]), which is why opening and closing a file for the sandbox
+//! leaves the embedder's locks alone. It also means that a path to one of the
+//! worker's own descriptors is [`table::thread_fd_path`] and never
+//! `/proc/self/fd/N`, that nothing here calls `tracing` (a
+//! [`Diagnostic`] is handed to the launcher instead), and that nothing here
+//! panics: the embedder's panic hook would run on a thread whose descriptor
+//! numbers it knows nothing about.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -21,14 +30,16 @@ use rustix::fs::{
     XattrFlags,
 };
 
-use super::Context;
 use super::check::InodeId;
+use super::diag::Diagnostic;
 use super::filter::{Syscall, WRITE_OPEN_FLAGS};
+use super::home::Context;
 use super::net;
 use super::notify::Reply;
 use super::pool::Kind;
 use super::resolve::{self, AT_FDCWD, Base, Caller, Place};
 use super::sink::Operation;
+use super::table;
 
 /// A failed call, as the errno the caller sees.
 #[derive(Clone, Copy, Debug)]
@@ -227,9 +238,11 @@ pub(crate) fn refuse(ctx: &Context, call: &Call<'_>, operation: Operation, targe
         .caller
         .status()
         .map_or(call.caller.tid, |status| status.tgid);
-    ctx.shared()
+    let said = ctx
+        .shared()
         .sink
         .record(operation, target, tgid, call.caller.tid);
+    ctx.shared().say(said);
     EACCES
 }
 
@@ -545,7 +558,7 @@ fn open_tmpfile(
 /// Whether the directory `parent` has a default ACL, which a created entry
 /// would take its permissions from and which the pooled inode cannot reproduce.
 fn has_default_acl(parent: &OwnedFd) -> bool {
-    let path = format!("/proc/self/fd/{}", parent.as_raw_fd());
+    let path = table::thread_fd_path(parent);
     let mut probe: [u8; 0] = [];
     matches!(
         rustix::fs::getxattr(path, "system.posix_acl_default", &mut probe),
@@ -564,7 +577,10 @@ fn pooled(ctx: &Context, place: &Place, kind: Kind) -> Result<Option<(OwnedFd, S
         Ok(entry) => entry,
         Err(false) => return Ok(None),
         Err(true) => {
-            tracing::error!(directory = %place.parent_path.display(), "{}", pool.describe(kind));
+            shared.say(
+                Diagnostic::error(pool.describe(kind))
+                    .field("directory", place.parent_path.display()),
+            );
             return Err(Errno(libc::ENOSPC));
         }
     };
@@ -611,7 +627,7 @@ fn settle(
     if directory && setgid {
         bits |= libc::S_ISGID;
     }
-    let path = format!("/proc/self/fd/{}", held.as_raw_fd());
+    let path = table::thread_fd_path(held);
     rustix::fs::chmodat(CWD, &path, Mode::from_bits_truncate(bits), AtFlags::empty())?;
     if setgid {
         rustix::fs::chownat(
@@ -787,7 +803,7 @@ fn link(ctx: &Context, call: &Call<'_>, old: (i32, usize), new: (i32, usize), fl
         check_source(ctx, call, &path, &stat)?;
         rustix::fs::linkat(
             CWD,
-            format!("/proc/self/fd/{}", held.as_raw_fd()),
+            table::thread_fd_path(&held),
             &destination.parent,
             destination.kernel_name(),
             AtFlags::SYMLINK_FOLLOW,
@@ -963,7 +979,7 @@ struct Held {
 
 impl Held {
     fn proc_path(&self) -> String {
-        format!("/proc/self/fd/{}", self.fd.as_raw_fd())
+        table::thread_fd_path(&self.fd)
     }
 
     fn is_symlink(&self) -> bool {
