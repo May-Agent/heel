@@ -80,7 +80,8 @@ on crates.io rather than from the merge:
 curl -s -H 'User-Agent: heel' https://crates.io/api/v1/crates/heel | grep -o '"max_version":"[^"]*"'
 ```
 
-`cargo publish` is irreversible. Never hand-edit `version =` or `CHANGELOG.md`:
+`cargo publish` is irreversible, so the merge of the release PR belongs to the
+user. Never merge it automatically, and never hand-edit `version =` or `CHANGELOG.md`:
 release-plz derives both from conventional-commit messages.
 
 ## Architecture
