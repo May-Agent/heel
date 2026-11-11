@@ -1938,21 +1938,25 @@ async fn sandbox_dropped_with_a_descendant_waiting<N: NetworkPolicy>(
     let output = sh(
         &sandbox,
         &format!(
-            "(setsid sh -c 'echo $$ > \"{0}.pid\"; while [ ! -e \"{0}\" ]; do sleep 0.1; done; {then}' </dev/null >/dev/null 2>&1 &); \
+            "(setsid sh -xc 'echo $$ > \"{0}.pid\"; while [ ! -e \"{0}\" ]; do sleep 0.1; done; {then}' </dev/null >/dev/null 2>\"{0}.trace\" &); \
              while [ ! -s \"{0}.pid\" ]; do sleep 0.05; done; echo started",
             go.display()
         ),
     )
     .await;
     assert_eq!(stdout(&output), "started", "{}", text(&output));
-    let descendant = Descendant(
-        std::fs::read_to_string(go.with_extension("pid"))
+    let mut descendant = Descendant {
+        pid: std::fs::read_to_string(go.with_extension("pid"))
             .unwrap()
             .trim()
             .parse()
             .unwrap(),
-    );
+        trace: go.with_extension("trace"),
+        history: Vec::new(),
+    };
+    descendant.note("before the drop");
     drop(sandbox);
+    descendant.note("right after the drop");
     // The launcher and the home thread end with the sandbox; the descendant has
     // not been told to go yet, so everything it does is after they are gone.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1967,19 +1971,40 @@ async fn sandbox_dropped_with_a_descendant_waiting<N: NetworkPolicy>(
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    descendant.note("once the launcher was gone");
     std::fs::write(go, "").unwrap();
     descendant
 }
 
 /// The process a sandbox left behind, by its pid in this namespace.
-struct Descendant(i32);
+struct Descendant {
+    pid: i32,
+    /// What its shell traced.
+    trace: PathBuf,
+    /// Where it was at each step of the test.
+    history: Vec<String>,
+}
 
 impl Descendant {
-    /// Where the process is now, for a failure to say: its state, the system
-    /// call it is in, and the broker's threads that are left to serve it.
+    fn note(&mut self, when: &str) {
+        self.history.push(format!("{when}: {}", self.now()));
+    }
+
+    /// Where the process was at each step and is now, for a failure to say.
     fn whereabouts(&self) -> String {
+        format!(
+            "{}\nnow: {}\ntrace:\n{}",
+            self.history.join("\n"),
+            self.now(),
+            std::fs::read_to_string(&self.trace).unwrap_or_else(|error| format!("<{error}>"))
+        )
+    }
+
+    /// Its state, the system call it is in, and the broker's threads that are
+    /// left to serve it.
+    fn now(&self) -> String {
         let read = |name: &str| {
-            std::fs::read_to_string(format!("/proc/{}/{name}", self.0))
+            std::fs::read_to_string(format!("/proc/{}/{name}", self.pid))
                 .unwrap_or_else(|error| format!("<{error}>"))
         };
         let state = read("status")
@@ -1988,7 +2013,7 @@ impl Descendant {
             .map_or_else(|| read("status"), str::to_owned);
         format!(
             "pid {}: {state}; syscall {}; broker threads {:?}",
-            self.0,
+            self.pid,
             read("syscall").trim(),
             broker_threads()
         )
