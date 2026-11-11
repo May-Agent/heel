@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_TRAVERSE,
+    FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
 };
 
 use super::acl::{self, Entry, Scope};
@@ -283,6 +283,7 @@ impl Container {
         }
 
         self.grant_null_device();
+        self.grant_mount_manager();
 
         Ok(())
     }
@@ -334,16 +335,55 @@ impl Container {
         const NULL_DEVICE: &str = r"\\.\NUL";
         const READ_WRITE: u32 = GENERIC_READ.0 | GENERIC_WRITE.0;
 
-        match acl::grant_object(NULL_DEVICE, self.grantee().as_string(), READ_WRITE) {
-            Ok(()) => {
-                self.record(NULL_DEVICE.to_owned(), Removal::Tree);
-                tracing::debug!("opened the null device to the container");
-            }
+        match self.grant_device(NULL_DEVICE, READ_WRITE) {
+            Ok(()) => tracing::debug!("opened the null device to the container"),
             Err(source) => tracing::warn!(
                 %source,
                 "cannot open the null device to the container; children that open NUL will be denied"
             ),
         }
+    }
+
+    /// Open the mount manager device to this container, for queries only.
+    ///
+    /// `GetFinalPathNameByHandleW` resolves a DOS or GUID volume name through
+    /// the mount manager, `\Device\MountPointManager`, and
+    /// `std::fs::canonicalize` asks it for the DOS one. On the Windows
+    /// versions where the device's access control list names nothing an
+    /// AppContainer token carries, the query is denied inside the container
+    /// and a path the container can read cannot be canonicalized (#203).
+    ///
+    /// The grant is the two rights a query needs, `FILE_READ_ATTRIBUTES` and
+    /// `SYNCHRONIZE`, and nothing the mount manager's changing requests need:
+    /// `IOCTL_MOUNTMGR_CREATE_POINT` and `IOCTL_MOUNTMGR_DELETE_POINTS` require
+    /// the handle to carry `FILE_READ_DATA` and `FILE_WRITE_DATA`, which stay
+    /// ungranted, so the container still cannot create or delete a mount point.
+    ///
+    /// Like the null device this one belongs to the machine, and some Windows
+    /// versions answer the query without the grant, so a host without the
+    /// rights to change the device's access control list keeps its sandbox —
+    /// the grant is attempted and a failure is reported rather than fatal.
+    fn grant_mount_manager(&self) {
+        const MOUNT_MANAGER: &str = r"\\.\MountPointManager";
+        // `FILE_READ_ATTRIBUTES` (0x80) and `SYNCHRONIZE` (0x100000), both
+        // winnt.h access rights, as the `windows` crate defines them.
+        const QUERY: u32 = FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0;
+
+        match self.grant_device(MOUNT_MANAGER, QUERY) {
+            Ok(()) => tracing::debug!("opened the mount manager to the container for queries"),
+            Err(source) => tracing::warn!(
+                %source,
+                "cannot open the mount manager to the container; where Windows requires it, children that canonicalize a path will be denied"
+            ),
+        }
+    }
+
+    /// Add `access` for this sandbox's ordinary-grant SID to the device
+    /// `name`, and record the entry for `drop` to take back.
+    fn grant_device(&self, name: &str, access: u32) -> io::Result<()> {
+        acl::grant_object(name, self.grantee().as_string(), access)?;
+        self.record(name.to_owned(), Removal::Tree);
+        Ok(())
     }
 
     /// Open one configured path to this container.
