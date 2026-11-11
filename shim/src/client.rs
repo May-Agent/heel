@@ -1,0 +1,137 @@
+//! Client for calling host commands from inside a sandbox.
+//!
+//! Sandboxed processes reach the host through the generated command shims,
+//! which run `heel-shim`. That executable uses this client, so the framing lives
+//! in one place and is exercised by the same tests as the server.
+
+use std::io::{Read, Write};
+use std::path::Path;
+
+use interprocess::local_socket::Stream;
+use interprocess::local_socket::traits::Stream as _;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::endpoint;
+use crate::protocol::{IpcError, IpcRequest, IpcResponse, MAX_FRAME_BYTES};
+
+/// A connection to a sandbox's IPC server.
+///
+/// Calls are blocking: the client runs in a short-lived helper process whose
+/// only job is to issue one request.
+#[derive(Debug)]
+pub struct IpcClient<S = Stream> {
+    stream: S,
+}
+
+impl IpcClient<Stream> {
+    /// Connect to the IPC socket at `path`.
+    ///
+    /// Inside a sandbox the path comes from `HEEL_IPC_ENDPOINT`.
+    pub fn connect(path: impl AsRef<Path>) -> Result<Self, IpcError> {
+        Ok(Self {
+            stream: Stream::connect(endpoint::name(path.as_ref())?)?,
+        })
+    }
+}
+
+impl IpcClient<std::net::TcpStream> {
+    /// Connect to a TCP IPC peer, bounding connection and I/O time by `timeout`.
+    pub fn connect_tcp(
+        address: std::net::SocketAddr,
+        timeout: std::time::Duration,
+    ) -> Result<Self, IpcError> {
+        let stream = std::net::TcpStream::connect_timeout(&address, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        stream.set_nodelay(true)?;
+        Ok(Self { stream })
+    }
+}
+
+impl<S: Read + Write> IpcClient<S> {
+    /// Call `method` with already-encoded MessagePack arguments.
+    ///
+    /// The request carries this process's current working directory, read now.
+    ///
+    /// Returns the encoded response payload, or the error the handler reported.
+    pub fn call_raw(&mut self, method: &str, params: &[u8]) -> Result<Vec<u8>, IpcError> {
+        let working_dir = std::env::current_dir()?;
+        self.stream
+            .write_all(&IpcRequest::encode(method, &working_dir, params)?)?;
+
+        let mut len_buf = [0u8; 4];
+        self.stream.read_exact(&mut len_buf)?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        if len == 0 || len > MAX_FRAME_BYTES {
+            return Err(IpcError::InvalidProtocol(format!(
+                "response length {len} is outside the 1..={MAX_FRAME_BYTES} byte range"
+            )));
+        }
+
+        let mut body = vec![0u8; len];
+        self.stream.read_exact(&mut body)?;
+
+        let response = IpcResponse::decode(&body)?;
+        if response.success {
+            return Ok(response.payload);
+        }
+
+        // A failure payload is a MessagePack string; fall back to the raw bytes
+        // only so a malformed error is still reported rather than swallowed.
+        let message = rmp_serde::from_slice::<String>(&response.payload)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&response.payload).into_owned());
+        Err(IpcError::Remote(message))
+    }
+
+    /// Call `method` with typed arguments and decode the typed response.
+    pub fn call<A: Serialize, R: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        args: &A,
+    ) -> Result<R, IpcError> {
+        let params = rmp_serde::to_vec_named(args)?;
+        let payload = self.call_raw(method, &params)?;
+        Ok(rmp_serde::from_slice(&payload)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Serialize, Deserialize)]
+    struct SumArgs {
+        a: i64,
+        b: i64,
+    }
+
+    #[test]
+    fn round_trips_typed_calls_over_tcp() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut length = [0; 4];
+            stream.read_exact(&mut length).expect("reads length");
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).expect("reads request");
+            let request = IpcRequest::decode(&body).expect("decodes request");
+            assert_eq!(request.method, "sum");
+            let args: SumArgs = rmp_serde::from_slice(&request.params).expect("arguments");
+            let response = IpcResponse::success(
+                rmp_serde::to_vec(&(args.a + args.b)).expect("encodes response"),
+            );
+            stream
+                .write_all(&response.encode())
+                .expect("writes response");
+        });
+        let mut client =
+            IpcClient::connect_tcp(address, std::time::Duration::from_secs(5)).expect("connects");
+        let result: i64 = client.call("sum", &SumArgs { a: 2, b: 40 }).expect("calls");
+        server.join().expect("server thread completes");
+        assert_eq!(result, 42);
+    }
+}

@@ -1,5 +1,5 @@
 #![doc = "Native Windows IPC entrypoints, process resolution and argument fidelity."]
-#![cfg(windows)]
+#![cfg(all(windows, feature = "shim"))]
 
 use std::borrow::Cow;
 
@@ -42,9 +42,6 @@ async fn sandbox() -> Sandbox {
     Sandbox::with_config_and_executor(
         SandboxConfigBuilder::default()
             .ipc(IpcRouter::new().register(Echo))
-            .heel_binary(
-                heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"),
-            )
             .build(),
         executor_core::tokio::TokioGlobal,
     )
@@ -68,6 +65,25 @@ async fn native_command_resolves_through_the_sandbox_path_and_preserves_argument
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), message);
+}
+
+#[tokio::test]
+async fn each_command_is_a_hard_link_of_the_shim_with_its_metadata_beside_it() {
+    let sandbox = sandbox().await;
+    let bin_dir = sandbox.config().ipc_bin_dir().expect("shims are written");
+
+    let shim = std::fs::read(bin_dir.join("heel-shim.exe")).expect("the shim executable");
+    assert!(!shim.is_empty());
+    assert_eq!(
+        std::fs::read(bin_dir.join("echo-native.exe")).expect("the command executable"),
+        shim,
+        "a command is the shim executable under its own name"
+    );
+    let metadata: heel::CommandMeta = serde_json::from_slice(
+        &std::fs::read(bin_dir.join("echo-native.json")).expect("the command metadata"),
+    )
+    .expect("the metadata decodes");
+    assert_eq!(metadata.positional_args.as_ref(), ["message"]);
 }
 
 #[tokio::test]

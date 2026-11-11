@@ -1,4 +1,5 @@
 #![doc = "Shims `heel shims` writes reach a router served over TCP, as in a container."]
+#![cfg(feature = "shim")]
 
 use std::borrow::Cow;
 use std::io::Write;
@@ -149,7 +150,7 @@ fn a_written_shim_reaches_the_router_over_tcp() {
 
 #[cfg(unix)]
 #[test]
-fn shims_are_owner_only_programs_beside_a_launcher() {
+fn shims_are_owner_only_programs_beside_the_shim_executable() {
     use std::os::unix::fs::PermissionsExt;
 
     let router = IpcRouter::new().register(Greet);
@@ -157,17 +158,14 @@ fn shims_are_owner_only_programs_beside_a_launcher() {
     let bin = dir.path().join("bin");
     write_shims(&bin, &router);
 
-    let launcher = std::fs::read_to_string(bin.join("heel")).expect("launcher");
-    assert!(
-        launcher.contains(env!("CARGO_BIN_EXE_heel")),
-        "the launcher runs the binary that wrote it: {launcher}"
-    );
+    let executable = std::fs::read(bin.join("heel-shim")).expect("shim executable");
+    assert!(!executable.is_empty(), "the shim executable is written");
     let shim = std::fs::read_to_string(bin.join("greet")).expect("shim");
     assert!(
-        shim.contains("ipc greet --positional name --stdin-arg note -- \"$@\""),
+        shim.contains("heel-shim\" greet --positional name --stdin-arg note -- \"$@\""),
         "the shim carries the declaration: {shim}"
     );
-    for path in [bin.clone(), bin.join("heel"), bin.join("greet")] {
+    for path in [bin.clone(), bin.join("heel-shim"), bin.join("greet")] {
         let mode = std::fs::metadata(&path)
             .expect("exists")
             .permissions()

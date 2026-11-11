@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "nodejs"]
+members = [".", "nodejs", "shim"]
 
 # Lints are configured once for the workspace so the library, the CLI and the
 # Node bindings are all held to the same standard.
@@ -38,14 +38,24 @@ categories = ["os", "development-tools"]
 name = "heel"
 path = "src/bin/heel/main.rs"
 
+[[example]]
+name = "ipc_commands"
+required-features = ["shim"]
+
 [features]
-default = ["python"]
+default = ["python", "shim"]
 python = ["which"]
+# Embeds the `heel-shim` executable, which sandboxed processes run to call host
+# commands. `SandboxConfigBuilder::ipc`, `IpcCommands::write_shims` and
+# `heel shims` need it; `direct_ipc` and `external_ipc` do not.
+shim = []
 
 [lints]
 workspace = true
 
 [dependencies]
+# The IPC wire protocol and client, shared with the `heel-shim` executable.
+heel-shim = { path = "shim", version = "0.1.0" }
 clap = { version = "4", features = ["derive", "env"] }
 # Serialization for IPC
 serde = { version = "1", features = ["derive"] }
@@ -76,7 +86,6 @@ smol = "2"
 
 # Compile-time templates
 askama = "0.12"
-shell-escape = "0.1"
 
 # Terminal raw mode
 crossterm = "0.29"
@@ -93,7 +102,6 @@ smol-hyper = "0.1.1"
 async-channel = "2.5.0"
 interprocess = { version = "2", default-features = false }
 dunce = "1.0.5"
-http = "1"
 
 # Unix process management
 [target.'cfg(unix)'.dependencies]
@@ -142,8 +150,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
 ] }
 
-[target."cfg(windows)".dependencies]
-sha2 = "=0.10.9"
+[build-dependencies]
+# The version of the shim the build script embeds.
+heel-shim = { path = "shim", version = "0.1.0" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

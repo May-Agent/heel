@@ -1,4 +1,4 @@
-//! `heel ipc`: invoke a host command from inside a sandbox.
+//! Invoke a host command from inside a sandbox.
 //!
 //! The generated command shims exec this with the command's declared argument
 //! names, so all parsing happens here rather than in shell script.
@@ -6,39 +6,36 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
-use heel::IpcClient;
+use heel_shim::{IpcClient, TcpIpcEndpoint};
 use serde_json::Value;
 
-use crate::cli::IpcArgs;
+use crate::args::IpcArgs;
 use crate::error::{CliError, CliResult};
 
 /// Environment variable carrying the sandbox's IPC socket path.
 const ENDPOINT_VAR: &str = "HEEL_IPC_ENDPOINT";
 
 /// Send the request and print whatever the handler returned.
-pub async fn execute(args: IpcArgs) -> CliResult<()> {
+pub fn execute(args: IpcArgs) -> CliResult<()> {
     let endpoint = std::env::var_os(ENDPOINT_VAR).ok_or(CliError::MissingIpcEndpoint)?;
-    let peer = match endpoint
+    let params = rmp_serde::to_vec_named(&build_params(&args, read_stdin)?)?;
+    let payload = match endpoint
         .to_str()
         .filter(|value| value.starts_with("tcp://"))
     {
-        Some(value) => Some(heel::ipc::TcpIpcEndpoint::resolve(value, args.timeout).await?),
-        None => None,
-    };
-    blocking::unblock(move || {
-        let params = rmp_serde::to_vec_named(&build_params(&args, read_stdin)?)?;
-        let payload = match peer {
-            Some(peer) => IpcClient::connect_tcp(peer.address(), peer.timeout())?
-                .call_raw(&args.command, &params)?,
-            None => IpcClient::connect(&endpoint)?.call_raw(&args.command, &params)?,
-        };
-        let rendered = render(&payload)?;
-        if !rendered.is_empty() {
-            write_rendered(&mut io::stdout().lock(), &rendered)?;
+        Some(value) => {
+            let peer =
+                futures_lite::future::block_on(TcpIpcEndpoint::resolve(value, args.timeout))?;
+            IpcClient::connect_tcp(peer.address(), peer.timeout())?
+                .call_raw(&args.command, &params)?
         }
-        Ok(())
-    })
-    .await
+        None => IpcClient::connect(&endpoint)?.call_raw(&args.command, &params)?,
+    };
+    let rendered = render(&payload)?;
+    if !rendered.is_empty() {
+        write_rendered(&mut io::stdout().lock(), &rendered)?;
+    }
+    Ok(())
 }
 
 /// Turn command-line arguments into the named parameters the handler expects.
@@ -207,7 +204,6 @@ mod tests {
             positional: positional.iter().map(|s| s.to_string()).collect(),
             raw_args: false,
             stdin_arg: stdin_arg.map(str::to_string),
-            verbose: false,
             args: rest.iter().map(|s| s.to_string()).collect(),
         }
     }

@@ -7,7 +7,6 @@
 
 use std::process::{ExitCode, ExitStatus};
 
-#[cfg(not(windows))]
 use clap::Parser;
 use executor_core::smol::SmolGlobal;
 use executor_core::try_init_global_executor;
@@ -16,8 +15,6 @@ mod cli;
 mod commands;
 mod config;
 mod error;
-#[cfg(windows)]
-mod native;
 mod sandbox;
 
 use cli::{Cli, Commands};
@@ -25,16 +22,7 @@ use config::{load_config, merge_config};
 use error::CliResult;
 
 fn main() -> ExitCode {
-    #[cfg(not(windows))]
     let cli = Cli::parse();
-    #[cfg(windows)]
-    let cli = match native::parse() {
-        Ok(cli) => cli,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
 
     let default_filter = if cli.verbose() {
         "heel=debug"
@@ -73,11 +61,6 @@ fn main() -> ExitCode {
 
 /// Dispatch to a subcommand, returning the exit code to report.
 async fn run(cli: Cli) -> CliResult<i32> {
-    if let Commands::Ipc(args) = cli.command {
-        // `heel ipc` runs inside a sandbox and takes no sandbox configuration.
-        return commands::ipc::execute(args).await.map(|()| 0);
-    }
-
     match cli.command {
         Commands::Run(args) => {
             let config = configure(&args.common)?;
@@ -93,8 +76,8 @@ async fn run(cli: Cli) -> CliResult<i32> {
             let config = configure(&args.common)?;
             commands::python::execute(args, config).await
         }
+        #[cfg(feature = "shim")]
         Commands::Shims(args) => commands::shims::execute(args).await.map(|()| 0),
-        Commands::Ipc(_) => unreachable!("handled above"),
         #[cfg(target_os = "linux")]
         Commands::Supervise(_) => unreachable!("handled in main"),
     }

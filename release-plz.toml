@@ -1,0 +1,11 @@
+# heel's tags stay `heel-v<version>`. Pinned here because release-plz picks its
+# default from the number of published packages in the workspace.
+[[package]]
+name = "heel"
+git_tag_name = "heel-v{{ version }}"
+
+# The shim is released on its own, and its prebuilt executables are attached to
+# that release: heel's build script downloads them from the tag named here.
+[[package]]
+name = "heel-shim"
+git_tag_name = "shim/v{{ version }}"

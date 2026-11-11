@@ -25,10 +25,11 @@ use futures_lite::FutureExt as _;
 use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use interprocess::local_socket::{ListenerOptions, Stream};
 
+use heel_shim::endpoint;
+use heel_shim::{IpcError, IpcRequest, IpcResponse, MAX_FRAME_BYTES};
+
 use crate::accept::ShutdownSignal;
 use crate::ipc::command::IpcContext;
-use crate::ipc::endpoint;
-use crate::ipc::protocol::{IpcError, IpcRequest, IpcResponse, MAX_FRAME_BYTES};
 use crate::ipc::router::IpcRouter;
 
 /// Longest usable Unix socket path.
@@ -500,5 +501,128 @@ mod tests {
             rmp_serde::from_slice::<String>(&echoed.payload).unwrap(),
             "9"
         );
+    }
+
+    /// The client of `heel-shim` against this server, over a local socket.
+    mod client {
+        use super::*;
+        use heel_shim::IpcClient;
+        use serde::Serialize;
+
+        struct Sum;
+
+        #[derive(Serialize, Deserialize)]
+        struct SumArgs {
+            a: i64,
+            b: i64,
+        }
+
+        impl IpcCommand for Sum {
+            fn name(&self) -> Cow<'static, str> {
+                "sum".into()
+            }
+
+            type Args = SumArgs;
+            type Response = i64;
+
+            async fn handle(&self, args: SumArgs, _context: IpcContext) -> Result<i64, IpcError> {
+                Ok(args.a + args.b)
+            }
+        }
+
+        struct Failing;
+
+        impl IpcCommand for Failing {
+            fn name(&self) -> Cow<'static, str> {
+                "failing".into()
+            }
+
+            type Args = i64;
+            type Response = ();
+
+            async fn handle(&self, _args: i64, _context: IpcContext) -> Result<(), IpcError> {
+                Err(IpcError::remote("the handler gave up"))
+            }
+        }
+
+        /// Start a server on a temporary socket for one test.
+        async fn serve(dir: &tempfile::TempDir, router: IpcRouter) -> IpcServer {
+            IpcServer::new(
+                dir.path().join("ipc.sock"),
+                router,
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("server starts")
+        }
+
+        #[tokio::test]
+        async fn round_trips_typed_calls() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let server = serve(&dir, IpcRouter::new().register(Sum)).await;
+            let socket = server.socket_path().to_path_buf();
+
+            let sum: i64 = tokio::task::spawn_blocking(move || {
+                let mut client = IpcClient::connect(&socket).expect("connects");
+                client.call("sum", &SumArgs { a: 2, b: 40 }).expect("calls")
+            })
+            .await
+            .expect("client task completes");
+
+            assert_eq!(sum, 42);
+        }
+
+        #[tokio::test]
+        async fn handler_errors_surface_as_remote_errors() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let server = serve(&dir, IpcRouter::new().register(Failing)).await;
+            let socket = server.socket_path().to_path_buf();
+
+            let decode_error = {
+                let socket = socket.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut client = IpcClient::connect(&socket).expect("connects");
+                    // `Failing` expects an integer, so a map is a decoding error.
+                    client
+                        .call::<_, ()>("failing", &serde_json::json!({ "unexpected": true }))
+                        .expect_err("must fail")
+                })
+                .await
+                .expect("client task completes")
+            };
+            assert!(
+                matches!(decode_error, IpcError::Remote(ref message) if message.contains("deserialization")),
+                "unexpected error: {decode_error:?}"
+            );
+
+            // A well-formed call reaches the handler, whose failure must surface
+            // the same way rather than arriving as a serialized result.
+            let error = tokio::task::spawn_blocking(move || {
+                let mut client = IpcClient::connect(&socket).expect("connects");
+                client.call::<_, ()>("failing", &1).expect_err("must fail")
+            })
+            .await
+            .expect("client task completes");
+            assert!(
+                matches!(error, IpcError::Remote(ref message) if message.contains("the handler gave up")),
+                "unexpected error: {error:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn unknown_methods_surface_as_remote_errors() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let server = serve(&dir, IpcRouter::new()).await;
+            let socket = server.socket_path().to_path_buf();
+
+            let error = tokio::task::spawn_blocking(move || {
+                let mut client = IpcClient::connect(&socket).expect("connects");
+                client.call_raw("nope", &[]).expect_err("must fail")
+            })
+            .await
+            .expect("client task completes");
+
+            assert!(matches!(error, IpcError::Remote(_)), "got {error:?}");
+        }
     }
 }
