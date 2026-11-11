@@ -10,6 +10,10 @@
 //! Paths that mean something different to each reader are resolved for the
 //! caller: `/proc/self`, `/dev/stdout` and `/dev/fd` would otherwise hand the
 //! sandbox this process's own descriptors and memory.
+//!
+//! The thread that resolves has a descriptor table of its own, so a path to one
+//! of its own descriptors is `/proc/thread-self/fd/N` and never `/proc/self/fd/N`,
+//! which names the embedder's table (see [`super::table`]).
 
 use std::cell::OnceCell;
 use std::ffi::OsStr;
@@ -21,6 +25,7 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, ResolveFlags};
 
 use super::notify::{self, Listener};
+use super::table;
 
 /// `AT_FDCWD`.
 pub(crate) const AT_FDCWD: i32 = -100;
@@ -245,9 +250,12 @@ fn on_procfs(fd: &impl AsFd) -> io::Result<bool> {
     Ok(rustix::fs::fstatfs(fd)?.f_type as i64 == PROC_SUPER_MAGIC)
 }
 
-/// The real path of a descriptor this process holds.
+/// The real path of a descriptor this thread holds.
+///
+/// Read through `/proc/thread-self`: the thread's table is its own, and
+/// `/proc/self/fd` would name the descriptor of that number in the embedder's.
 pub(crate) fn real_path(fd: &impl AsRawFd) -> io::Result<PathBuf> {
-    let link = rustix::fs::readlink(format!("/proc/self/fd/{}", fd.as_raw_fd()), Vec::new())?;
+    let link = rustix::fs::readlink(table::thread_fd_path(fd), Vec::new())?;
     Ok(PathBuf::from(OsStr::from_bytes(link.to_bytes())))
 }
 

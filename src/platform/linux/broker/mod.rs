@@ -19,29 +19,46 @@
 //!   `connect` alone, which is what limits outbound TCP to the proxy's loopback
 //!   address, a restriction Landlock can only express for a port.
 //!
-//! Every sandboxed process is forked from the launcher thread, whose Landlock
-//! domain is the broker's, so the sandbox's domain is a descendant of it and
-//! Landlock lets the broker read the memory of, and take descriptors from, the
-//! processes it serves.
+//! The broker lives in the embedder's process, on threads of four kinds:
+//!
+//! * the launcher (`heel-launcher`), in the embedder's descriptor table,
+//!   forks every sandboxed process, so the sandbox's Landlock domain is a
+//!   descendant of the launcher's, which is the broker's, and Landlock lets the
+//!   broker read the memory of, and take descriptors from, the processes it
+//!   serves. It receives each process's seccomp listener and hands it on;
+//! * the log thread (`heel-broker-log`), also in the embedder's table, which
+//!   emits what the other threads have to say, and ends once no thread that
+//!   serves a sandbox is left;
+//! * the home thread (`heel-broker-home`), started by the launcher after it was
+//!   restricted, and the workers (`heel-broker`) it starts, which share its
+//!   table. They open the files for the sandbox;
+//! * the setup thread (`heel-broker-setup`), which lists the directories
+//!   above and inside the denied paths while the broker is built.
+//!
+//! The last two kinds each have a descriptor table of their own, because a
+//! POSIX lock the embedder holds on a file is released by any close of the file
+//! in the embedder's table. See [`table`] for the rule and what it demands of
+//! the code that runs on those threads.
 
 mod check;
+mod diag;
 mod filter;
+mod home;
 mod net;
 mod notify;
 mod ops;
 mod pool;
 mod resolve;
 pub(crate) mod sink;
+mod table;
 
 use std::collections::HashSet;
 use std::io;
-use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use landlock::Access as _;
 use libc::sock_filter;
@@ -49,192 +66,17 @@ use libc::sock_filter;
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::linux::landlock_rules::{
-    self, Planned, PreparedRuleset, REQUIRED_ABI, without_writes,
+    self, Carved, Planned, PreparedRuleset, REQUIRED_ABI, without_writes,
 };
 
 use check::Guard;
-use filter::{Coverage, Syscall};
-use notify::{Listener, Reply};
-use ops::{Call, Errno};
-use pool::Pool;
-use resolve::Caller;
+use diag::Diagnostic;
+use filter::Coverage;
+use pool::{Pool, PoolPlan};
 use sink::DenialSink;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) use filter::x32_refusal;
-
-/// The most threads that serve one sandbox, however many calls block.
-const MAX_WORKERS: usize = 256;
-
-/// What every thread that serves a sandbox shares.
-#[derive(Debug)]
-pub(crate) struct Shared {
-    guard: Guard,
-    pool: Option<Pool>,
-    sink: Arc<DenialSink>,
-    rename_lock: RwLock<()>,
-    proxy_port: Option<u16>,
-    sync_wake_up: bool,
-}
-
-/// The lock a call holds while it is served.
-pub(crate) enum Held<'a> {
-    /// Taken by a call that names no file.
-    None,
-    /// Taken by every call but a rename.
-    Shared(#[allow(dead_code)] RwLockReadGuard<'a, ()>),
-    /// Taken by a rename, so that no name changes under a call that checked it.
-    Exclusive(#[allow(dead_code)] RwLockWriteGuard<'a, ()>),
-}
-
-impl Shared {
-    /// Lock for serving `syscall`.
-    pub(crate) fn hold_for(&self, syscall: Syscall) -> Held<'_> {
-        // A connect to an inet address names no file and can take long, so it
-        // must not hold up the renames that wait for the write side.
-        if syscall == Syscall::Connect {
-            return Held::None;
-        }
-        if matches!(
-            syscall,
-            Syscall::Rename | Syscall::Renameat | Syscall::Renameat2
-        ) {
-            Held::Exclusive(
-                self.rename_lock
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner),
-            )
-        } else {
-            Held::Shared(
-                self.rename_lock
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner),
-            )
-        }
-    }
-
-    /// The shared side of the lock, for a call that turns out to name a file.
-    pub(crate) fn read_lock(&self) -> Held<'_> {
-        self.hold_for(Syscall::Open)
-    }
-
-    /// Whether a connection to `ip:port` is the one the sandbox may make.
-    pub(crate) fn proxy_reachable(&self, ip: Ipv4Addr, port: u16) -> bool {
-        ip == crate::network::PROXY_ADDRESS && self.proxy_port == Some(port)
-    }
-}
-
-/// The listener of one sandboxed process tree and the threads serving it.
-#[derive(Debug)]
-struct Serving {
-    listener: Listener,
-    shared: Arc<Shared>,
-    idle: AtomicUsize,
-    threads: AtomicUsize,
-    base: usize,
-}
-
-/// What a handler needs to serve one call.
-pub(crate) struct Context<'a> {
-    serving: &'a Arc<Serving>,
-}
-
-impl Context<'_> {
-    pub(crate) fn shared(&self) -> &Shared {
-        &self.serving.shared
-    }
-
-    /// Make sure another thread is listening before this one blocks in a call
-    /// that can take long, so that it never holds up the others.
-    pub(crate) fn ensure_spare_worker(&self) {
-        if self.serving.idle.load(Ordering::Acquire) == 0
-            && self.serving.threads.load(Ordering::Acquire) < MAX_WORKERS
-            && let Err(error) = spawn_worker(self.serving)
-        {
-            tracing::error!(%error, "broker: cannot start a worker");
-        }
-    }
-}
-
-fn spawn_worker(serving: &Arc<Serving>) -> io::Result<()> {
-    serving.threads.fetch_add(1, Ordering::AcqRel);
-    serving.idle.fetch_add(1, Ordering::AcqRel);
-    let worker = Arc::clone(serving);
-    let spawned = std::thread::Builder::new()
-        .name("heel-broker".to_owned())
-        .spawn(move || work(&worker));
-    if let Err(error) = spawned {
-        serving.threads.fetch_sub(1, Ordering::AcqRel);
-        serving.idle.fetch_sub(1, Ordering::AcqRel);
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn work(serving: &Arc<Serving>) {
-    // A thread of its own working directory and file creation mask, so serving
-    // one call never changes what another sees.
-    // SAFETY: `unshare(CLONE_FS)` takes a flag and touches only this thread.
-    if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
-        tracing::error!(error = %io::Error::last_os_error(), "broker: unshare(CLONE_FS) failed");
-        serving.threads.fetch_sub(1, Ordering::AcqRel);
-        serving.idle.fetch_sub(1, Ordering::AcqRel);
-        return;
-    }
-    loop {
-        match serving.listener.recv() {
-            Ok(notification) => {
-                serving.idle.fetch_sub(1, Ordering::AcqRel);
-                serve(serving, &notification);
-                let idle = serving.idle.fetch_add(1, Ordering::AcqRel) + 1;
-                if serving.threads.load(Ordering::Acquire) > serving.base && idle > 1 {
-                    break;
-                }
-            }
-            Err(error) if error.raw_os_error() == Some(libc::EINTR) => {}
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                if serving.listener.is_orphaned() {
-                    break;
-                }
-            }
-            Err(error) => {
-                tracing::error!(%error, "broker: receive failed");
-                break;
-            }
-        }
-    }
-    serving.idle.fetch_sub(1, Ordering::AcqRel);
-    serving.threads.fetch_sub(1, Ordering::AcqRel);
-}
-
-fn serve(serving: &Arc<Serving>, notification: &libc::seccomp_notif) {
-    let listener = &serving.listener;
-    let id = notification.id;
-    let Some(syscall) = filter::classify(notification.data.nr) else {
-        tracing::error!(
-            nr = notification.data.nr,
-            "broker: a call the filter does not name"
-        );
-        let _ = listener.reply(id, Reply::Errno(libc::ENOSYS));
-        return;
-    };
-    let caller = Caller::new(listener, id, notification.pid);
-    let call = Call {
-        syscall,
-        args: notification.data.args,
-        caller: &caller,
-    };
-    let context = Context { serving };
-    let reply = match ops::serve(&context, &call) {
-        Ok(reply) => reply,
-        Err(Errno(errno)) => Reply::Errno(errno),
-    };
-    if let Err(error) = listener.reply(id, reply)
-        && error.raw_os_error() != Some(libc::ENOENT)
-    {
-        tracing::debug!(%error, "broker: reply failed");
-    }
-}
 
 /// A process to start through the launcher.
 struct Job {
@@ -246,6 +88,10 @@ struct Job {
 /// The broker of one sandbox.
 pub(crate) struct Broker {
     program: Vec<sock_filter>,
+    /// Dropping the broker drops this, which ends the launcher, which closes its
+    /// end of the home thread's socket and so ends the home thread. The workers
+    /// go on until their listeners are orphaned, which serves a descendant that
+    /// outlives the sandbox.
     jobs: Sender<Job>,
 }
 
@@ -287,7 +133,10 @@ impl ChildHook {
             return Err(io::Error::last_os_error());
         }
         let listener = listener as RawFd;
-        let sent = notify::send_fd(self.socket.as_raw_fd(), listener);
+        // SAFETY: `listener` was returned by the call above and stays open until
+        // it is closed below, after the send.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(listener) };
+        let sent = table::send_fds(self.socket.as_fd(), &[borrowed]);
         // SAFETY: `listener` was returned by the call above and is not used again.
         unsafe { libc::close(listener) };
         sent
@@ -324,6 +173,115 @@ fn parse_ptrace_scope(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// What the setup thread worked out.
+struct Prepared {
+    carved: Carved,
+    guard: Guard,
+    pool: Option<PoolPlan>,
+}
+
+/// The setup thread's work: list the directories around the denied paths, make
+/// the inode pool, and build the guard. Returns what it has to say whatever
+/// came of it.
+///
+/// Runs on a thread with a descriptor table of its own, so it never calls
+/// `tracing`. The pool's directory descriptors go to the starter over `socket`.
+fn prepare(
+    config: &SandboxConfigData,
+    plan: &[Planned],
+    abi: landlock::ABI,
+    socket: &OwnedFd,
+) -> (Vec<Diagnostic>, Result<Prepared>) {
+    let mut log = Vec::new();
+    let outcome = (|| {
+        let denied: Vec<PathBuf> = match config.read_denylist() {
+            Some(read) => {
+                let resolved = read.resolve()?;
+                resolved
+                    .trees
+                    .into_iter()
+                    .filter(|tree| !resolved.sockets.contains(tree))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let carved = landlock_rules::carve(plan.to_vec(), &denied, abi)?;
+        let pool = if carved.ancestors.is_empty() {
+            None
+        } else {
+            let (pool, held) = Pool::prepare(config.inode_pool(), &carved.ancestors, &mut log)?;
+            // A pool that found no place anywhere has nothing to hand on.
+            if pool.is_empty() {
+                None
+            } else {
+                let held: Vec<BorrowedFd<'_>> = held.iter().map(AsFd::as_fd).collect();
+                table::send_fds(socket.as_fd(), &held).map_err(|error| {
+                    Error::InitFailed(format!("cannot hand the inode pool on: {error}"))
+                })?;
+                Some(pool)
+            }
+        };
+        let ancestors: HashSet<PathBuf> = carved
+            .ancestors
+            .iter()
+            .map(|ancestor| ancestor.path.clone())
+            .collect();
+        let pool_dirs = pool.as_ref().map_or_else(Vec::new, PoolPlan::directories);
+        let guard = Guard::new(config, ancestors, pool_dirs)?;
+        Ok(Prepared {
+            carved,
+            guard,
+            pool,
+        })
+    })();
+    (log, outcome)
+}
+
+/// An [`Error::InitFailed`] that says what was being done.
+fn init(what: &'static str) -> impl FnOnce(io::Error) -> Error {
+    move |error| Error::InitFailed(format!("{what}: {error}"))
+}
+
+/// Run `body` on the setup thread, which has a descriptor table of its own, with
+/// the thread's end of a socket, and return what it returned with the other end.
+fn on_the_setup_thread<R: Send>(body: impl FnOnce(&OwnedFd) -> R + Send) -> Result<(R, OwnedFd)> {
+    let (ours, theirs) = table::socket_pair().map_err(init("cannot make the setup socket"))?;
+    let done = std::thread::scope(|scope| {
+        let setup = table::spawn_scoped(scope, "heel-broker-setup", theirs, |socket| body(&socket))
+            .map_err(init("cannot start the broker's setup thread"))?;
+        match setup.join() {
+            Ok(Some(done)) => Ok(done),
+            Ok(None) | Err(_) => Err(Error::InitFailed(
+                "the broker's setup thread did not finish".to_owned(),
+            )),
+        }
+    })?;
+    Ok((done, ours))
+}
+
+/// Run [`prepare`] on the setup thread, with the descriptors it sends.
+fn prepare_on_a_thread(
+    config: &SandboxConfigData,
+    plan: &[Planned],
+    abi: landlock::ABI,
+) -> Result<(Prepared, Vec<OwnedFd>)> {
+    let ((log, outcome), ours) = on_the_setup_thread(|socket| prepare(config, plan, abi, socket))?;
+    // Emitted here, in the embedder's table, whether or not the setup worked.
+    for diagnostic in log {
+        diagnostic.emit();
+    }
+    let prepared = outcome?;
+    let held = match &prepared.pool {
+        Some(_) => table::recv_fds(ours.as_fd())
+            .map_err(init("cannot receive the inode pool's directories"))?
+            .ok_or_else(|| {
+                Error::InitFailed("the setup thread sent no inode pool directories".to_owned())
+            })?,
+        None => Vec::new(),
+    };
+    Ok((prepared, held))
+}
+
 impl Broker {
     /// The broker a configuration needs, if it needs one.
     pub(crate) fn new(
@@ -339,47 +297,28 @@ impl Broker {
         check_ptrace_scope()?;
 
         let abi = REQUIRED_ABI;
-        let (sandbox_ruleset, guard, pool, broker_rules, coverage) = if denylists {
+        let (sandbox_ruleset, guard, pool, held, broker_rules, coverage) = if denylists {
             let plan = landlock_rules::plan(config);
-            let denied: Vec<PathBuf> = match config.read_denylist() {
-                Some(read) => {
-                    let resolved = read.resolve()?;
-                    resolved
-                        .trees
-                        .into_iter()
-                        .filter(|tree| !resolved.sockets.contains(tree))
-                        .collect()
-                }
-                None => Vec::new(),
-            };
-            let carved = landlock_rules::carve(plan.clone(), &denied, abi)?;
+            let (prepared, held) = prepare_on_a_thread(config, &plan, abi)?;
+            let Prepared {
+                carved,
+                guard,
+                pool,
+            } = prepared;
             let sandbox_rules = without_writes(&carved.rules, abi);
             let mut sandbox_ruleset = landlock_rules::instantiate(&sandbox_rules, proxy_port, abi)?;
             let reads = landlock_rules::read_rights(abi);
-            let pool = if carved.ancestors.is_empty() {
-                None
-            } else {
-                Some(Pool::create(
-                    config.inode_pool(),
-                    &carved.ancestors,
-                    &mut |fd, access| {
-                        let access = access & reads;
-                        if access.is_empty() {
-                            Ok(())
-                        } else {
-                            sandbox_ruleset.add_inode(fd, access, abi)
-                        }
-                    },
-                )?)
-            };
-            let ancestors: HashSet<PathBuf> = carved
-                .ancestors
-                .iter()
-                .map(|ancestor| ancestor.path.clone())
-                .collect();
-            let pool_dirs = pool.as_ref().map_or_else(Vec::new, Pool::directories);
-            let guard = Guard::new(config, ancestors, pool_dirs.clone())?;
-
+            if let Some(pool) = &pool {
+                pool.grant(&held, &mut |fd, access| {
+                    let access = access & reads;
+                    if access.is_empty() {
+                        Ok(())
+                    } else {
+                        sandbox_ruleset.add_inode(fd, access, abi)
+                    }
+                })?;
+            }
+            let pool_dirs = pool.as_ref().map_or_else(Vec::new, PoolPlan::directories);
             let mut broker_rules = plan;
             for directory in pool_dirs {
                 broker_rules.push(Planned {
@@ -392,13 +331,23 @@ impl Broker {
                 files: true,
                 reads: guard.watches_reads(),
             };
-            (sandbox_ruleset, guard, pool, Some(broker_rules), coverage)
+            (
+                sandbox_ruleset,
+                guard,
+                pool,
+                held,
+                Some(broker_rules),
+                coverage,
+            )
         } else {
+            // Nothing here lists a user's directory: the guard reads only the
+            // mount table, and there is no pool.
             let guard = Guard::new(config, HashSet::new(), Vec::new())?;
             (
                 landlock_rules::build_ruleset(config, proxy_port)?,
                 guard,
                 None,
+                Vec::new(),
                 None,
                 Coverage {
                     files: false,
@@ -408,29 +357,34 @@ impl Broker {
         };
 
         let program = filter::build(coverage)?;
-        let shared = Arc::new(Shared {
-            guard,
-            pool,
-            sink,
-            rename_lock: RwLock::new(()),
-            proxy_port,
-            sync_wake_up: config.broker_sync_wake_up(),
-        });
         let broker_ruleset = broker_rules
             .map(|rules| landlock_rules::instantiate(&rules, proxy_port, abi))
             .transpose()?;
 
+        let diagnostics =
+            diag::start().map_err(init("cannot start the broker's diagnostics thread"))?;
         let (jobs, queue) = channel();
         let (ready, started) = sync_channel(1);
-        let launcher_shared = Arc::clone(&shared);
+        let launch = Launch {
+            ruleset: broker_ruleset,
+            held,
+            setup: home::Setup {
+                guard,
+                pool,
+                sink,
+                proxy_port,
+                sync_wake_up: config.broker_sync_wake_up(),
+                diagnostics,
+            },
+        };
         std::thread::Builder::new()
             .name("heel-launcher".to_owned())
-            .spawn(move || launch(broker_ruleset, &queue, &launcher_shared, &ready))
+            .spawn(move || launcher(launch, &queue, &ready))
             .map_err(|error| Error::InitFailed(format!("cannot start the broker: {error}")))?;
         started
             .recv()
             .map_err(|_| Error::InitFailed("the broker's launcher exited".to_owned()))?
-            .map_err(|error| Error::InitFailed(format!("cannot restrict the broker: {error}")))?;
+            .map_err(|error| Error::InitFailed(error.to_string()))?;
 
         tracing::info!(full = denylists, "broker started");
         Ok(Some((Self { program, jobs }, sandbox_ruleset)))
@@ -480,51 +434,93 @@ impl Broker {
     }
 }
 
-/// The launcher thread: restricted once, then forking every sandboxed process.
-fn launch(
+/// What the launcher thread is started with.
+struct Launch {
     ruleset: Option<PreparedRuleset>,
-    jobs: &Receiver<Job>,
-    shared: &Arc<Shared>,
-    ready: &SyncSender<io::Result<()>>,
-) {
-    let restricted = match ruleset {
-        Some(ruleset) => ruleset.restrict_self(),
-        None => Ok(()),
-    };
-    let failed = restricted.is_err();
-    let _ = ready.send(restricted);
-    if failed {
-        return;
+    /// The inode pool's directories, to send to the home thread.
+    held: Vec<OwnedFd>,
+    setup: home::Setup,
+}
+
+/// The launcher's end of the home thread.
+struct HomeLink {
+    socket: OwnedFd,
+    acknowledgements: Receiver<io::Result<()>>,
+}
+
+/// Restrict this thread, start the home thread, and wait until it is ready.
+fn start_home(launch: Launch) -> io::Result<HomeLink> {
+    let Launch {
+        ruleset,
+        held,
+        setup,
+    } = launch;
+    if let Some(ruleset) = ruleset {
+        ruleset
+            .restrict_self()
+            .map_err(|error| io::Error::other(format!("cannot restrict the broker: {error}")))?;
     }
-    let workers = std::thread::available_parallelism().map_or(2, usize::from);
-    for mut job in jobs {
-        let outcome = job.command.spawn().and_then(|mut child| {
-            let started = notify::recv_fd(job.listener_socket.as_raw_fd()).and_then(|fd| {
-                let listener = Listener::new(fd);
-                if shared.sync_wake_up {
-                    listener.set_sync_wake_up()?;
-                }
-                let serving = Arc::new(Serving {
-                    listener,
-                    shared: Arc::clone(shared),
-                    idle: AtomicUsize::new(0),
-                    threads: AtomicUsize::new(0),
-                    base: workers,
-                });
-                for _ in 0..workers {
-                    spawn_worker(&serving)?;
-                }
-                Ok(())
-            });
-            match started {
-                Ok(()) => Ok(child),
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    Err(error)
-                }
-            }
-        });
+    let (ours, theirs) = table::socket_pair()?;
+    let (acknowledge, acknowledgements) = channel();
+    let has_pool = setup.pool.is_some();
+    // Started after the restriction, so it is in the same Landlock domain.
+    table::spawn("heel-broker-home", theirs, move |socket| {
+        home::run(&socket, setup, &acknowledge);
+    })
+    .map_err(|error| io::Error::other(format!("cannot start the broker's home thread: {error}")))?;
+    if has_pool {
+        let held: Vec<BorrowedFd<'_>> = held.iter().map(AsFd::as_fd).collect();
+        table::send_fds(ours.as_fd(), &held)?;
+    }
+    acknowledgements
+        .recv()
+        .map_err(|_| io::Error::other("the broker's home thread ended before it was ready"))??;
+    Ok(HomeLink {
+        socket: ours,
+        acknowledgements,
+    })
+}
+
+/// Start `job`'s process, hand its listener to the home thread, and wait until
+/// the workers are listening.
+fn start_job(home: &HomeLink, job: &mut Job) -> io::Result<Child> {
+    let mut child = job.command.spawn()?;
+    let handed_over = (|| {
+        let listener = table::recv_fds(job.listener_socket.as_fd())?.ok_or_else(|| {
+            io::Error::other("the sandboxed process ended before it handed over its listener")
+        })?;
+        let borrowed: Vec<BorrowedFd<'_>> = listener.iter().map(AsFd::as_fd).collect();
+        table::send_fds(home.socket.as_fd(), &borrowed)?;
+        // The launcher's own copy goes: the home thread's is the one that counts.
+        drop(listener);
+        home.acknowledgements
+            .recv()
+            .map_err(|_| io::Error::other("the broker's home thread ended"))?
+    })();
+    match handed_over {
+        Ok(()) => Ok(child),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+/// The launcher thread: restricted once, then forking every sandboxed process.
+///
+/// Ends when the broker is dropped and the queue of jobs is empty.
+fn launcher(launch: Launch, queue: &Receiver<Job>, ready: &SyncSender<io::Result<()>>) {
+    let home = match start_home(launch) {
+        Ok(home) => home,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(()));
+    for mut job in queue {
+        let outcome = start_job(&home, &mut job);
         let _ = job.reply.send(outcome);
     }
 }
@@ -565,5 +561,48 @@ mod ptrace_scope_tests {
             parse_ptrace_scope("lots").unwrap_err(),
             Error::InitFailed(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod setup_thread_tests {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    /// The setup thread lists the user's directories, so what it holds open must
+    /// be its own: looked at from inside, as the setup runs.
+    #[test]
+    fn the_setup_thread_holds_null_and_its_socket_and_nothing_of_the_starters() {
+        let held: Vec<File> = (0..40)
+            .map(|_| File::open("/proc/self/stat").unwrap())
+            .collect();
+        let ((name, table, socket), _ours) = on_the_setup_thread(|socket| {
+            (
+                std::thread::current().name().map(str::to_owned),
+                table::listing::thread_table(),
+                socket.as_raw_fd(),
+            )
+        })
+        .unwrap();
+        assert_eq!(name.as_deref(), Some("heel-broker-setup"));
+        let numbers: Vec<_> = table.iter().map(|(number, _)| *number).collect();
+        assert_eq!(numbers, [0, 1, 2, socket], "{table:?}");
+        for (number, target) in &table[..3] {
+            assert_eq!(
+                target,
+                std::path::Path::new("/dev/null"),
+                "descriptor {number}"
+            );
+        }
+        assert!(
+            held.iter().all(|file| file.as_raw_fd() > 2),
+            "the test held descriptors that the setup thread could have inherited"
+        );
+        assert!(
+            table::listing::thread_table().len() > held.len(),
+            "the starter's own table is the large one"
+        );
     }
 }

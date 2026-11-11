@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::diag::Diagnostic;
 use crate::denial::Denial;
 
 /// What a refused call was trying to do, named as the macOS profile names it.
@@ -94,20 +95,25 @@ impl DenialSink {
     }
 
     /// Record that `operation` on `target` was refused for the process `pid`
-    /// (thread `tid`).
-    pub(crate) fn record(&self, operation: Operation, target: &Path, pid: u32, tid: u32) {
+    /// (thread `tid`), and return what to say about it: it runs on a broker
+    /// thread, which does not log.
+    pub(crate) fn record(
+        &self,
+        operation: Operation,
+        target: &Path,
+        pid: u32,
+        tid: u32,
+    ) -> Diagnostic {
         let process = std::fs::read_to_string(format!("/proc/{tid}/comm"))
             .map(|name| name.trim_end().to_owned())
             .unwrap_or_default();
-        tracing::debug!(
-            operation = operation.name(),
-            target = %target.display(),
-            pid,
-            %process,
-            "broker: refused"
-        );
+        let said = Diagnostic::debug("broker: refused")
+            .field("operation", operation.name())
+            .field("target", target.display())
+            .field("pid", pid)
+            .field("process", &process);
         if self.count.load(Ordering::Acquire) == 0 {
-            return;
+            return said;
         }
         let denial = Denial {
             timestamp: local_time(),
@@ -129,6 +135,7 @@ impl DenialSink {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(denial.clone());
         }
+        said
     }
 }
 
@@ -170,11 +177,11 @@ mod tests {
     #[test]
     fn denials_are_collected_only_between_subscribe_and_finish() {
         let sink = DenialSink::default();
-        sink.record(Operation::ReadData, Path::new("/before"), 1, 1);
+        drop(sink.record(Operation::ReadData, Path::new("/before"), 1, 1));
         let subscriber = sink.subscribe();
-        sink.record(Operation::WriteCreate, Path::new("/during"), 1, 1);
+        drop(sink.record(Operation::WriteCreate, Path::new("/during"), 1, 1));
         let denials = sink.finish(&subscriber);
-        sink.record(Operation::ReadData, Path::new("/after"), 1, 1);
+        drop(sink.record(Operation::ReadData, Path::new("/after"), 1, 1));
 
         assert_eq!(denials.len(), 1);
         assert_eq!(denials[0].operation, "file-write-create");

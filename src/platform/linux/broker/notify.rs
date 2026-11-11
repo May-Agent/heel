@@ -16,7 +16,7 @@
 
 use std::io;
 use std::mem::{MaybeUninit, size_of};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 /// `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP`, 6.6: wake the supervisor on the stopped
 /// task's CPU, which keeps a round trip from migrating.
@@ -267,82 +267,4 @@ pub(crate) fn steal_fd(tgid: u32, fd: RawFd) -> io::Result<OwnedFd> {
     let stolen =
         rustix::process::pidfd_getfd(&pidfd, fd, rustix::process::PidfdGetfdFlags::empty())?;
     Ok(stolen)
-}
-
-/// Receive one descriptor sent over a unix socket.
-pub(crate) fn recv_fd(socket: RawFd) -> io::Result<OwnedFd> {
-    let mut data = 0u8;
-    let mut iov = libc::iovec {
-        iov_base: (&raw mut data).cast(),
-        iov_len: 1,
-    };
-    let space = cmsg_space();
-    let mut control = vec![0u8; space];
-    // SAFETY: an all-zero `msghdr` is a valid empty message header.
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &raw mut iov;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = space as _;
-    // SAFETY: `message` describes buffers that outlive the call.
-    let received = unsafe { libc::recvmsg(socket, &raw mut message, libc::MSG_CMSG_CLOEXEC) };
-    if received < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `message` was filled in by `recvmsg` above.
-    let header = unsafe { libc::CMSG_FIRSTHDR(&raw const message) };
-    if header.is_null() {
-        return Err(io::Error::other("no descriptor arrived with the listener"));
-    }
-    // SAFETY: the header is non-null and inside `control`.
-    let (level, kind) = unsafe { ((*header).cmsg_level, (*header).cmsg_type) };
-    if level != libc::SOL_SOCKET || kind != libc::SCM_RIGHTS {
-        return Err(io::Error::other(
-            "the listener arrived as the wrong message",
-        ));
-    }
-    // SAFETY: an `SCM_RIGHTS` message carries one `RawFd` at `CMSG_DATA`.
-    let fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<RawFd>()) };
-    // SAFETY: the kernel installed `fd` for this process and nothing else owns it.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// The control-message space for one descriptor.
-pub(crate) const fn cmsg_space() -> usize {
-    // SAFETY: `CMSG_SPACE` is arithmetic on its argument.
-    unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize }
-}
-
-/// Send `fd` over `socket` with `sendmsg`, using nothing but the stack, so it
-/// can run between `fork` and `exec`.
-pub(crate) fn send_fd(socket: RawFd, fd: RawFd) -> io::Result<()> {
-    let mut data = 0u8;
-    let mut iov = libc::iovec {
-        iov_base: (&raw mut data).cast(),
-        iov_len: 1,
-    };
-    // Aligned for `cmsghdr`, and large enough for one descriptor.
-    let mut control = [0u64; 8];
-    debug_assert!(cmsg_space() <= size_of::<[u64; 8]>());
-    // SAFETY: an all-zero `msghdr` is a valid empty message header.
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &raw mut iov;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = cmsg_space() as _;
-    // SAFETY: the control buffer holds one header and one descriptor.
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&raw const message);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(), fd);
-    }
-    // SAFETY: `message` describes buffers that outlive the call.
-    let sent = unsafe { libc::sendmsg(socket, &raw const message, 0) };
-    if sent < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }
