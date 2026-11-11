@@ -87,11 +87,8 @@ async fn canonicalize_resolves_paths_under_every_kind_of_grant() {
     )
     .await;
 
-    // The whole report goes to the log first, so the step that failed is
-    // visible whichever path it failed on. Nextest keeps the output of a
-    // passing test out of the log; the report is also in the assertion
-    // message, which a failure always shows.
-    println!("{report}");
+    // The assertion message carries the whole report, so a failure names the
+    // step that was denied whichever path it failed on.
     for label in ["read", "write", "workdir"] {
         let line = format!("step=canonicalize path={label} ok");
         assert!(
@@ -118,7 +115,6 @@ async fn the_sandbox_cannot_open_the_mount_manager_to_change_mount_points() {
 
     let report = run(&sandbox, &probe, &["mountmgr-write"]).await;
 
-    println!("{report}");
     let line = format!("step=mountmgr_read_write_data path=none err={ERROR_ACCESS_DENIED}");
     assert!(
         report.lines().any(|reported| reported == line),
