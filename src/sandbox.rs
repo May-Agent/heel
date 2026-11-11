@@ -10,7 +10,7 @@ use executor_core::{DefaultExecutor, Executor, try_init_global_executor};
 
 use crate::binary::HeelBinary;
 use crate::command::{Command, ProxyEndpoint};
-use crate::config::{SandboxConfig, SandboxConfigData};
+use crate::config::{IpcRoute, SandboxConfig, SandboxConfigData};
 use crate::denial::DenialRecorder;
 use crate::error::{Error, Result};
 use crate::grant::Access;
@@ -304,9 +304,18 @@ impl<N: NetworkPolicy> Sandbox<N> {
         }
 
         let (ipc_server, ipc_socket_dir) = match (router, config_data.external_ipc()) {
-            (Some(router), None) => {
+            (Some(IpcRoute::Shimmed(router)), None) => {
                 let (server, socket_dir) =
                     Self::start_ipc(&mut config_data, router, executor).await?;
+                (Some(server), Some(socket_dir))
+            }
+            (Some(IpcRoute::Direct(router)), None) => {
+                // The client is linked into the sandboxed process, so there is
+                // nothing to write and no binary to locate: only the socket.
+                let (socket_dir, socket) = unblock(create_ipc_socket_dir).await?;
+                config_data.set_ipc_socket(Some(socket.clone()));
+                let server = IpcServer::new(socket, router, executor).await?;
+                tracing::debug!("serving IPC to direct clients; no shims, no heel binary");
                 (Some(server), Some(socket_dir))
             }
             (None, Some(endpoint)) => {
