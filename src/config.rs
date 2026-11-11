@@ -600,11 +600,31 @@ impl SandboxConfigData {
     }
 }
 
+/// How a router is served to the sandbox.
+///
+/// The route is stored with the router, so "a router without a route" and
+/// "a route without a router" cannot be built.
+pub(crate) enum IpcRoute {
+    /// Command shims on `PATH` that run the `heel` binary.
+    Shimmed(IpcRouter),
+    /// Processes that link [`IpcClient`](crate::IpcClient) connect themselves:
+    /// no shims and no `heel` binary.
+    Direct(IpcRouter),
+}
+
+impl IpcRoute {
+    fn router(&self) -> &IpcRouter {
+        match self {
+            Self::Shimmed(router) | Self::Direct(router) => router,
+        }
+    }
+}
+
 /// A sandbox configuration: a network policy plus everything else.
 pub struct SandboxConfig<N: NetworkPolicy = DenyAll> {
     network: N,
     data: SandboxConfigData,
-    ipc: Option<IpcRouter>,
+    ipc: Option<IpcRoute>,
 }
 
 impl SandboxConfig<DenyAll> {
@@ -626,8 +646,8 @@ impl Default for SandboxConfig<DenyAll> {
 }
 
 impl<N: NetworkPolicy> SandboxConfig<N> {
-    /// Split the configuration into its policy, its data, and its IPC router.
-    pub(crate) fn into_parts(self) -> (N, SandboxConfigData, Option<IpcRouter>) {
+    /// Split the configuration into its policy, its data, and its IPC route.
+    pub(crate) fn into_parts(self) -> (N, SandboxConfigData, Option<IpcRoute>) {
         (self.network, self.data, self.ipc)
     }
 
@@ -643,7 +663,7 @@ impl<N: NetworkPolicy> SandboxConfig<N> {
 
     /// The IPC router, if one is registered.
     pub fn ipc(&self) -> Option<&IpcRouter> {
-        self.ipc.as_ref()
+        self.ipc.as_ref().map(IpcRoute::router)
     }
 }
 
@@ -657,7 +677,7 @@ pub struct IpcConfigured;
 pub struct SandboxConfigBuilder<N: NetworkPolicy = DenyAll, I = IpcUnconfigured> {
     network: N,
     data: SandboxConfigData,
-    ipc: Option<IpcRouter>,
+    ipc: Option<IpcRoute>,
     ipc_state: std::marker::PhantomData<I>,
 }
 
@@ -941,7 +961,29 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N, IpcUnconfigured> {
     ///
     /// Selects the sole IPC route; a configured builder cannot select another.
     pub fn ipc(mut self, router: IpcRouter) -> SandboxConfigBuilder<N, IpcConfigured> {
-        self.ipc = Some(router);
+        self.ipc = Some(IpcRoute::Shimmed(router));
+        self.configured()
+    }
+
+    /// Serve host-side commands to sandboxed processes that link [`IpcClient`](crate::IpcClient)
+    /// and connect to [`Sandbox::ipc_endpoint`](crate::Sandbox::ipc_endpoint) themselves.
+    ///
+    /// No command shims are written, no shim directory goes on the child's
+    /// `PATH`, and no `heel` binary is located, verified or granted. The
+    /// socket is granted to the sandbox as for [`ipc`](Self::ipc), and the
+    /// child finds it in `HEEL_IPC_ENDPOINT`.
+    ///
+    /// # IPC state
+    ///
+    /// Selects the sole IPC route; a configured builder cannot select another.
+    /// ```compile_fail
+    /// use heel::{SandboxConfigBuilder, ipc::IpcRouter};
+    /// SandboxConfigBuilder::default()
+    ///     .direct_ipc(IpcRouter::new())
+    ///     .ipc(IpcRouter::new());
+    /// ```
+    pub fn direct_ipc(mut self, router: IpcRouter) -> SandboxConfigBuilder<N, IpcConfigured> {
+        self.ipc = Some(IpcRoute::Direct(router));
         self.configured()
     }
 
