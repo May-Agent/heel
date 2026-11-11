@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.7](https://github.com/May-Agent/heel/compare/heel-v0.9.6...heel-v0.9.7) - 2026-11-11
+
+### Added
+
+- *(ipc)* serve a router to processes that link IpcClient, with no heel binary
+
 ## [0.9.6](https://github.com/May-Agent/heel/compare/heel-v0.9.5...heel-v0.9.6) - 2026-11-11
 
 ### Fixed
