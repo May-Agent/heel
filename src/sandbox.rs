@@ -8,17 +8,22 @@ use blocking::unblock;
 use executor_core::smol::SmolGlobal;
 use executor_core::{DefaultExecutor, Executor, try_init_global_executor};
 
+#[cfg(target_os = "linux")]
 use crate::binary::HeelBinary;
 use crate::command::{Command, ProxyEndpoint};
 use crate::config::{IpcRoute, SandboxConfig, SandboxConfigData};
 use crate::denial::DenialRecorder;
 use crate::error::{Error, Result};
+#[cfg(any(target_os = "linux", feature = "shim"))]
 use crate::grant::Access;
-use crate::ipc::{IpcLayout, IpcServer};
+#[cfg(feature = "shim")]
+use crate::ipc::IpcLayout;
+use crate::ipc::IpcServer;
 use crate::network::{DenyAll, NetworkPolicy, NetworkProxy};
 #[cfg(target_os = "macos")]
 use crate::platform::macos::attribution::{AttributionError, Membership};
 use crate::platform::{self, NativeBackend};
+#[cfg(any(target_os = "linux", feature = "shim"))]
 use crate::resolve::ResolvedPath;
 use crate::workdir::WorkingDir;
 
@@ -33,7 +38,7 @@ fn create_ipc_socket_dir() -> Result<(WorkingDir, PathBuf)> {
     Ok((root, socket))
 }
 
-/// Locate the `heel` binary that IPC wrappers execute.
+/// Locate the `heel` binary the supervisor executes.
 ///
 /// A configured [`HeelBinary`] is already verified and is used as is; without
 /// one the binary is located and verified ([`HeelBinary::locate`]), which runs
@@ -41,6 +46,7 @@ fn create_ipc_socket_dir() -> Result<(WorkingDir, PathBuf)> {
 /// it is often reached through a link (a package manager's shim): the link is
 /// followed unless it lies at or below a path the sandbox may write, where the
 /// sandbox could have planted it.
+#[cfg(target_os = "linux")]
 async fn resolve_heel_binary(
     configured: Option<HeelBinary>,
     writable: Vec<PathBuf>,
@@ -304,6 +310,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
         }
 
         let (ipc_server, ipc_socket_dir) = match (router, config_data.external_ipc()) {
+            #[cfg(feature = "shim")]
             (Some(IpcRoute::Shimmed(router)), None) => {
                 let (server, socket_dir) =
                     Self::start_ipc(&mut config_data, router, executor).await?;
@@ -311,21 +318,17 @@ impl<N: NetworkPolicy> Sandbox<N> {
             }
             (Some(IpcRoute::Direct(router)), None) => {
                 // The client is linked into the sandboxed process, so there is
-                // nothing to write and no binary to locate: only the socket.
+                // nothing to write and no executable to run: only the socket.
                 let (socket_dir, socket) = unblock(create_ipc_socket_dir).await?;
                 config_data.set_ipc_socket(Some(socket.clone()));
                 let server = IpcServer::new(socket, router, executor).await?;
-                tracing::debug!("serving IPC to direct clients; no shims, no heel binary");
+                tracing::debug!("serving IPC to direct clients; no shims");
                 (Some(server), Some(socket_dir))
             }
             (None, Some(endpoint)) => {
+                // The shims that reach this relay were written elsewhere
+                // (`IpcCommands::write_shims`) and are granted by the caller.
                 let (socket_dir, socket) = unblock(create_ipc_socket_dir).await?;
-                let heel_binary = resolve_heel_binary(
-                    config_data.heel_binary().cloned(),
-                    config_data.writable_paths(),
-                )
-                .await?;
-                config_data.push_grant(heel_binary, Access::EXEC);
                 config_data.set_ipc_socket(Some(socket.clone()));
                 let server = IpcServer::new(socket, endpoint, executor).await?;
                 (Some(server), Some(socket_dir))
@@ -392,37 +395,29 @@ impl<N: NetworkPolicy> Sandbox<N> {
     ///
     /// Returns the server together with the private directory holding its
     /// socket, which the sandbox owns and removes on drop.
+    #[cfg(feature = "shim")]
     async fn start_ipc<E: Executor + Clone + 'static>(
         config_data: &mut SandboxConfigData,
         router: crate::ipc::IpcRouter,
         executor: E,
     ) -> Result<(IpcServer, WorkingDir)> {
-        let heel_binary = resolve_heel_binary(
-            config_data.heel_binary().cloned(),
-            config_data.writable_paths(),
-        )
-        .await?;
-
         // Writing the shims and creating the socket directory are both blocking
         // filesystem work; the router is handed to the worker and handed back so
         // it can move on to the server.
-        let write_binary = heel_binary.as_path().to_path_buf();
         let (router, socket_dir, bin_dir, socket) = unblock(
             move || -> Result<(crate::ipc::IpcRouter, WorkingDir, PathBuf, PathBuf)> {
                 let (socket_dir, socket) = create_ipc_socket_dir()?;
                 let layout = IpcLayout::new(socket_dir.path());
-                layout.write(router.commands(), &write_binary)?;
+                layout.write(router.commands())?;
                 let bin_dir = layout.bin_dir().to_path_buf();
                 Ok((router, socket_dir, bin_dir, socket))
             },
         )
         .await?;
+        // The shim directory holds the shim executable and the scripts that
+        // run it: executable, and not writable, from inside the sandbox.
         config_data.push_grant(ResolvedPath::new(&bin_dir)?, Access::EXEC);
         config_data.set_ipc_bin_dir(bin_dir);
-
-        // The launcher execs the host binary, so it must be executable from
-        // inside the sandbox even if it lives under a restricted path.
-        config_data.push_grant(heel_binary, Access::EXEC);
         config_data.set_ipc_socket(Some(socket.clone()));
 
         let server = IpcServer::new(socket, router, executor).await?;

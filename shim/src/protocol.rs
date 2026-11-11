@@ -32,7 +32,7 @@ const VERSIONED_MARKER: u8 = 0;
 
 /// Largest frame either side will read, to bound the memory one request can
 /// make the peer allocate.
-pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Errors raised while serving or issuing an IPC request.
 #[derive(Debug, Error)]
@@ -91,7 +91,7 @@ impl IpcRequest {
             return Err(IpcError::InvalidProtocol(format!(
                 "the client speaks an unversioned protocol older than version 1, \
                  the host speaks protocol version {PROTOCOL_VERSION}; \
-                 the heel binary the sandbox runs is out of date"
+                 the heel-shim the sandbox runs is out of date"
             )));
         }
         let (&version, rest) = rest
@@ -101,7 +101,7 @@ impl IpcRequest {
             return Err(IpcError::InvalidProtocol(format!(
                 "the client speaks protocol version {version}, \
                  the host speaks protocol version {PROTOCOL_VERSION}; \
-                 the heel binary the sandbox runs does not match the library"
+                 the heel-shim the sandbox runs does not match the library"
             )));
         }
         let (&method_len, rest) = rest

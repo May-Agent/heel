@@ -1,28 +1,36 @@
 //! Generation of the command shims a sandboxed process sees on its `PATH`.
 //!
-//! Each registered IPC command gets a small script that execs
-//! `heel ipc <command>`: in a sandbox's `.heel/bin`, or in the directory
-//! [`IpcCommands::write_shims`] is given. The scripts carry no argument-parsing logic of their
-//! own: they forward the declared argument names to `heel ipc`, which does the
-//! parsing in Rust where it can be tested.
+//! A shim directory holds the `heel-shim` executable the library embeds, and
+//! one program per registered IPC command that runs it with the command's
+//! declared arguments: in a sandbox's `.heel/bin`, or in the directory
+//! [`IpcCommands::write_shims`] is given. On Unix each command is a small script
+//! beside the executable; on Windows it is a hard link to the executable
+//! with the command's metadata in `<command>.json` beside it. Neither carries
+//! argument-parsing logic of its own: that is `heel-shim`'s, in Rust, where it
+//! can be tested.
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use askama::Template;
 
-use crate::binary::HeelBinary;
 use crate::error::{Error, Result};
-use crate::ipc::router::{CommandMeta, IpcCommands};
+use crate::ipc::paths::{HEEL_DIR_NAME, WRAPPER_DIR_NAME};
+use crate::ipc::router::IpcCommands;
+use heel_shim::CommandMeta;
 
-/// Directory inside the working directory holding sandbox-private files.
-pub const HEEL_DIR_NAME: &str = ".heel";
-/// Directory inside [`HEEL_DIR_NAME`] holding the generated command shims.
-pub const WRAPPER_DIR_NAME: &str = "bin";
-/// File name of the IPC socket inside its private directory.
-pub const SOCKET_NAME: &str = "s";
+/// The `heel-shim` executable for the target this library is built for,
+/// produced by the build script.
+const SHIM_EXECUTABLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heel-shim"));
+
+/// File name of the shim executable inside a shim directory.
+const SHIM_FILE_NAME: &str = if cfg!(windows) {
+    "heel-shim.exe"
+} else {
+    "heel-shim"
+};
 
 /// Wrapper script for one IPC command.
 #[cfg(unix)]
@@ -33,14 +41,6 @@ struct WrapperTemplate<'a> {
     positional_args: &'a [Cow<'static, str>],
     stdin_arg: Option<&'a str>,
     raw_args: bool,
-}
-
-/// The `heel` launcher placed alongside the wrappers.
-#[cfg(unix)]
-#[derive(Template)]
-#[template(path = "ipc/heel_launcher.sh", escape = "none")]
-struct LauncherTemplate<'a> {
-    binary: &'a str,
 }
 
 /// Where a sandbox's IPC files live.
@@ -71,12 +71,12 @@ impl IpcLayout {
         &self.bin_dir
     }
 
-    /// Create the directories and write the launcher and command shims.
+    /// Create the directories and write the shim executable and command shims.
     ///
     /// This is blocking work; callers run it off the async executor.
-    pub(crate) fn write(&self, commands: &IpcCommands, heel_binary: &Path) -> Result<()> {
+    pub(crate) fn write(&self, commands: &IpcCommands) -> Result<()> {
         create_private_dir(&self.heel_dir)?;
-        write_shims(&self.bin_dir, commands, heel_binary)
+        write_shims(&self.bin_dir, commands)
     }
 }
 
@@ -84,68 +84,46 @@ impl IpcCommands {
     /// Write the shims of these commands into `dir`, which is created
     /// owner-only if it does not exist.
     ///
-    /// `dir` then holds what a sandbox's shim directory holds: a `heel`
-    /// launcher that runs `heel`, and one program per command that runs
-    /// `heel ipc` with the command's declared arguments. Put on `PATH`, the
-    /// commands are ordinary programs that reach the endpoint
-    /// `HEEL_IPC_ENDPOINT` names. This is for a process that runs where the
-    /// router does not, such as a container reaching the router's host
-    /// through `tcp://`; a sandbox with a router writes its own shims.
+    /// `dir` then holds what a sandbox's shim directory holds: the `heel-shim`
+    /// executable, and one program per command that runs it with the command's
+    /// declared arguments. Put on `PATH`, the commands are ordinary programs
+    /// that reach the endpoint `HEEL_IPC_ENDPOINT` names. This is for a process
+    /// that runs where the router does not, such as a container reaching the
+    /// router's host through `tcp://`; a sandbox with a router writes its own
+    /// shims.
     ///
     /// This is blocking work; run it off the async executor.
-    pub fn write_shims(&self, dir: &Path, heel_binary: &HeelBinary) -> Result<()> {
-        write_shims(dir, self, heel_binary.as_path())
+    pub fn write_shims(&self, dir: &Path) -> Result<()> {
+        write_shims(dir, self)
     }
 }
 
-/// Create `bin_dir` and write the launcher for `heel_binary` and the shims of
-/// `commands` into it.
-fn write_shims(bin_dir: &Path, commands: &IpcCommands, heel_binary: &Path) -> Result<()> {
+/// Create `bin_dir` and write the shim executable and the shims of `commands`
+/// into it.
+fn write_shims(bin_dir: &Path, commands: &IpcCommands) -> Result<()> {
     create_private_dir(bin_dir)?;
 
+    let executable = bin_dir.join(SHIM_FILE_NAME);
+    write_executable(&executable, SHIM_EXECUTABLE)?;
+
     #[cfg(unix)]
-    {
-        let escaped = shell_escape::unix::escape(heel_binary.to_string_lossy());
-        write_script(
-            &bin_dir.join("heel"),
-            &LauncherTemplate { binary: &escaped }.render()?,
+    for (command, meta) in commands.iter() {
+        write_executable(
+            &bin_dir.join(command),
+            render_wrapper(command, meta)?.as_bytes(),
         )?;
-        for (command, meta) in commands.iter() {
-            write_script(&bin_dir.join(command), &render_wrapper(command, meta)?)?;
-        }
     }
     #[cfg(windows)]
-    {
-        let binary = bin_dir.join("heel.exe");
-        std::fs::copy(heel_binary, &binary).map_err(|source| Error::path(&binary, source))?;
-        for (command, meta) in commands.iter() {
-            let executable = bin_dir.join(command).with_extension("exe");
-            std::fs::hard_link(&binary, &executable)
-                .map_err(|source| Error::path(&executable, source))?;
-            let metadata = bin_dir.join(command).with_extension("json");
-            let contents = render_wrapper(command, meta)?;
-            std::fs::write(&metadata, contents).map_err(|source| Error::path(&metadata, source))?;
-        }
+    for (command, meta) in commands.iter() {
+        let linked = bin_dir.join(command).with_extension("exe");
+        std::fs::hard_link(&executable, &linked).map_err(|source| Error::path(&linked, source))?;
+        let metadata = bin_dir.join(command).with_extension("json");
+        let contents = render_wrapper(command, meta)?;
+        std::fs::write(&metadata, contents).map_err(|source| Error::path(&metadata, source))?;
     }
 
     tracing::debug!(bin_dir = %bin_dir.display(), "wrote IPC command shims");
     Ok(())
-}
-
-/// The directory to create the IPC socket in.
-///
-/// Unix socket paths are limited to about a hundred bytes, so the shortest
-/// available temporary root is chosen rather than the conventional one: on
-/// macOS the per-user temp directory alone is two thirds of the budget.
-pub(crate) fn socket_root() -> PathBuf {
-    let user_temp = std::env::temp_dir();
-    let shared_temp = PathBuf::from("/tmp");
-
-    if shared_temp.is_dir() && shared_temp.as_os_str().len() < user_temp.as_os_str().len() {
-        shared_temp
-    } else {
-        user_temp
-    }
 }
 
 /// Render the shim for one command.
@@ -179,9 +157,8 @@ fn create_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write an executable script.
-#[cfg(unix)]
-fn write_script(path: &Path, contents: &str) -> Result<()> {
+/// Write a program only its owner can run.
+fn write_executable(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::write(path, contents).map_err(|source| Error::path(path, source))?;
 
     #[cfg(unix)]
@@ -199,6 +176,7 @@ mod tests {
     use super::*;
     use crate::ipc::{IpcCommand, IpcContext, IpcRouter, NoArgs};
     use serde::Deserialize;
+    use std::borrow::Cow;
 
     struct Search;
 
@@ -264,7 +242,7 @@ mod tests {
 
         #[cfg(unix)]
         assert!(script.contains(
-            "heel\" ipc search --positional query --positional scope --stdin-arg input -- \"$@\""
+            "heel-shim\" search --positional query --positional scope --stdin-arg input -- \"$@\""
         ));
         #[cfg(windows)]
         {
@@ -288,7 +266,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            assert!(script.contains("heel\" ipc plain -- \"$@\""));
+            assert!(script.contains("heel-shim\" plain -- \"$@\""));
             assert!(!script.contains("--positional"));
             assert!(!script.contains("--stdin-arg"));
         }
@@ -314,7 +292,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            assert!(script.contains("heel\" ipc tool --raw-args --stdin-arg input -- \"$@\""));
+            assert!(script.contains("heel-shim\" tool --raw-args --stdin-arg input -- \"$@\""));
             assert!(!script.contains("--positional"));
         }
         #[cfg(windows)]
@@ -326,21 +304,17 @@ mod tests {
     }
 
     #[test]
-    fn layout_writes_executable_owner_only_scripts() {
+    fn layout_writes_executable_owner_only_shims() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = IpcLayout::new(dir.path());
         let router = IpcRouter::new().register(Search).register(Plain);
 
-        #[cfg(unix)]
-        let binary = PathBuf::from("/usr/local/bin/heel");
-        #[cfg(windows)]
-        let binary = std::env::current_exe().expect("native test executable");
-        layout.write(router.commands(), &binary).expect("writes");
+        layout.write(router.commands()).expect("writes");
 
         #[cfg(unix)]
-        let names = ["heel", "search", "plain"];
+        let names = ["heel-shim", "search", "plain"];
         #[cfg(windows)]
-        let names = ["heel.exe", "search.exe", "plain.exe"];
+        let names = ["heel-shim.exe", "search.exe", "plain.exe"];
         for name in names {
             let path = layout.bin_dir().join(name);
             assert!(path.is_file(), "{name} must be written");
@@ -370,54 +344,27 @@ mod tests {
     }
 
     #[test]
-    fn launcher_escapes_the_binary_path() {
+    fn the_embedded_executable_is_written_whole() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let layout = IpcLayout::new(dir.path());
+        IpcRouter::new()
+            .register(Plain)
+            .commands()
+            .write_shims(dir.path())
+            .expect("writes");
 
-        #[cfg(unix)]
-        {
-            layout
-                .write(&IpcCommands::default(), Path::new("/opt/heel dir/heel"))
-                .expect("writes");
-            let launcher = std::fs::read_to_string(layout.bin_dir().join("heel")).expect("reads");
-            assert!(
-                launcher.contains("'/opt/heel dir/heel'"),
-                "unescaped path in: {launcher}"
-            );
-        }
+        let written = std::fs::read(dir.path().join(SHIM_FILE_NAME)).expect("reads");
+        assert!(!written.is_empty(), "the embedded executable is empty");
+        assert!(written == SHIM_EXECUTABLE);
         #[cfg(windows)]
-        {
-            let source = dir.path().join("heel dir");
-            std::fs::create_dir(&source).expect("directory with spaces");
-            let binary = source.join("heel.exe");
-            std::fs::copy(std::env::current_exe().expect("native binary"), &binary)
-                .expect("copies");
-            layout
-                .write(&IpcCommands::default(), &binary)
-                .expect("writes");
-            assert_eq!(
-                std::fs::read(&binary).expect("source"),
-                std::fs::read(layout.bin_dir().join("heel.exe")).expect("native launcher")
-            );
-        }
+        assert_eq!(
+            written,
+            std::fs::read(dir.path().join("plain.exe")).expect("the hard link")
+        );
     }
 
     #[test]
     fn shims_live_inside_the_working_directory() {
         let layout = IpcLayout::new(Path::new("/work"));
         assert_eq!(layout.bin_dir(), Path::new("/work/.heel/bin"));
-    }
-
-    #[test]
-    fn socket_root_leaves_room_for_the_socket_name() {
-        let root = socket_root();
-        assert!(root.is_dir(), "{} must exist", root.display());
-        // A per-sandbox directory and the socket name still have to fit inside
-        // the platform's sockaddr_un limit.
-        assert!(
-            root.as_os_str().len() + "/heel-0123abcd/s".len() < 100,
-            "{} leaves no room for a socket path",
-            root.display()
-        );
     }
 }

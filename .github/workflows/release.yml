@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing heel release tag to upload assets to
+        description: Existing release tag to upload assets to (heel-v<version> or shim/v<version>)
         required: false
         type: string
 
@@ -23,7 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       releases_created: ${{ steps.release.outputs.releases_created }}
-      release_tag: ${{ steps.release_tag.outputs.tag }}
+      heel_tag: ${{ steps.release_tags.outputs.heel_tag }}
+      shim_tag: ${{ steps.release_tags.outputs.shim_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,66 +40,84 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-      - name: Resolve released heel tag
-        id: release_tag
+      - name: Resolve released tags
+        id: release_tags
         if: steps.release.outputs.releases_created == 'true'
         env:
           RELEASES_JSON: ${{ steps.release.outputs.releases }}
         run: |
-          tag="$(jq -r '
-            map(select(.package_name == "heel")) as $releases
-            | if ($releases | length) == 1 then $releases[0].tag else empty end
-          ' <<<"${RELEASES_JSON}")"
-          if [[ -z "${tag}" ]]; then
-            echo "release-plz created releases but did not return exactly one heel release tag" >&2
+          # A run releases heel, heel-shim, or both: each package's tag, or
+          # nothing when that package was not released.
+          tag_of() {
+            jq -r --arg package "$1" '
+              map(select(.package_name == $package)) as $releases
+              | if ($releases | length) == 1 then $releases[0].tag
+                elif ($releases | length) == 0 then ""
+                else error("more than one release of " + $package) end
+            ' <<<"${RELEASES_JSON}"
+          }
+          heel_tag="$(tag_of heel)"
+          shim_tag="$(tag_of heel-shim)"
+          if [[ -z "${heel_tag}" && -z "${shim_tag}" ]]; then
+            echo "release-plz created releases but returned neither a heel nor a heel-shim release tag" >&2
             exit 1
           fi
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "heel_tag=${heel_tag}" >> "${GITHUB_OUTPUT}"
+          echo "shim_tag=${shim_tag}" >> "${GITHUB_OUTPUT}"
 
   resolve-release:
-    name: Resolve Release Tag
+    name: Resolve Release Tags
     if: ${{ always() }}
     runs-on: ubuntu-latest
     needs: release-plz
     outputs:
-      upload_assets: ${{ steps.resolve.outputs.upload_assets }}
-      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      heel_tag: ${{ steps.resolve.outputs.heel_tag }}
+      shim_tag: ${{ steps.resolve.outputs.shim_tag }}
     steps:
-      - name: Resolve release tag for asset upload
+      - name: Resolve release tags for asset upload
         id: resolve
         env:
           EVENT_NAME: ${{ github.event_name }}
           MANUAL_TAG: ${{ inputs.release_tag }}
           AUTO_RELEASES_CREATED: ${{ needs.release-plz.outputs.releases_created }}
-          AUTO_RELEASE_TAG: ${{ needs.release-plz.outputs.release_tag }}
+          AUTO_HEEL_TAG: ${{ needs.release-plz.outputs.heel_tag }}
+          AUTO_SHIM_TAG: ${{ needs.release-plz.outputs.shim_tag }}
         run: |
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             if [[ -z "${MANUAL_TAG}" ]]; then
               echo "workflow_dispatch requires the release_tag input" >&2
               exit 1
             fi
-            echo "upload_assets=true" >> "${GITHUB_OUTPUT}"
-            echo "release_tag=${MANUAL_TAG}" >> "${GITHUB_OUTPUT}"
+            case "${MANUAL_TAG}" in
+              shim/v*)
+                echo "heel_tag=" >> "${GITHUB_OUTPUT}"
+                echo "shim_tag=${MANUAL_TAG}" >> "${GITHUB_OUTPUT}"
+                ;;
+              heel-v*)
+                echo "heel_tag=${MANUAL_TAG}" >> "${GITHUB_OUTPUT}"
+                echo "shim_tag=" >> "${GITHUB_OUTPUT}"
+                ;;
+              *)
+                echo "release_tag must be heel-v<version> or shim/v<version>: ${MANUAL_TAG}" >&2
+                exit 1
+                ;;
+            esac
             exit 0
           fi
 
           if [[ "${AUTO_RELEASES_CREATED}" != "true" ]]; then
-            echo "upload_assets=false" >> "${GITHUB_OUTPUT}"
+            echo "heel_tag=" >> "${GITHUB_OUTPUT}"
+            echo "shim_tag=" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
-          if [[ -z "${AUTO_RELEASE_TAG}" ]]; then
-            echo "release-plz created a release but no heel tag was resolved" >&2
-            exit 1
-          fi
-
-          echo "upload_assets=true" >> "${GITHUB_OUTPUT}"
-          echo "release_tag=${AUTO_RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "heel_tag=${AUTO_HEEL_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "shim_tag=${AUTO_SHIM_TAG}" >> "${GITHUB_OUTPUT}"
 
   release-assets:
     name: Release Assets
     needs: resolve-release
-    if: ${{ always() && needs.resolve-release.outputs.upload_assets == 'true' }}
+    if: ${{ always() && needs.resolve-release.outputs.heel_tag != '' }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -124,7 +143,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve-release.outputs.release_tag }}
+          ref: ${{ needs.resolve-release.outputs.heel_tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -153,7 +172,72 @@ jobs:
       - name: Upload asset to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.heel_tag }}
         run: |
           gh release upload "${RELEASE_TAG}" "${{ steps.asset.outputs.asset_name }}#${{ steps.asset.outputs.asset_name }}" --clobber
 
+  # heel's build script downloads these executables by name from the shim's
+  # release, so the asset names here are part of its contract. Linux ones are
+  # static musl builds, which serve the gnu and musl targets of their
+  # architecture alike.
+  shim-assets:
+    name: Shim Assets
+    needs: resolve-release
+    if: ${{ always() && needs.resolve-release.outputs.shim_tag != '' }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.shim_tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build heel-shim
+        run: cargo build --locked --release --package heel-shim --bin heel-shim --target "${{ matrix.target }}"
+
+      - name: Prepare release asset
+        id: asset
+        run: |
+          asset_name="heel-shim-${{ matrix.target }}"
+          binary_path="target/${{ matrix.target }}/release/heel-shim"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            asset_name="${asset_name}.exe"
+            binary_path="${binary_path}.exe"
+          fi
+          cp "${binary_path}" "${asset_name}"
+          echo "asset_name=${asset_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.asset.outputs.asset_name }}
+
+      - name: Upload asset to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.shim_tag }}
+        run: |
+          gh release upload "${RELEASE_TAG}" "${{ steps.asset.outputs.asset_name }}#${{ steps.asset.outputs.asset_name }}" --clobber

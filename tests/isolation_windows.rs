@@ -536,6 +536,7 @@ impl IpcCommand for Probe {
     }
 }
 
+#[cfg(feature = "shim")]
 #[tokio::test]
 async fn the_ipc_endpoint_reaches_the_host_from_inside_the_container() {
     // On Windows the IPC endpoint is a named pipe — a kernel object with an
@@ -545,11 +546,10 @@ async fn the_ipc_endpoint_reaches_the_host_from_inside_the_container() {
     // meets "Access is denied" on its first call. The pipe has to be opened
     // to the container the way the null device is.
     //
-    // `heel ipc` is the real client, so this exercises the whole path:
+    // The `probe` shim is the real client, so this exercises the whole path:
     // connecting to the pipe, the request, dispatch, and the response.
     let calls = Arc::new(AtomicUsize::new(0));
     let config = SandboxConfigBuilder::default()
-        .heel_binary(heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"))
         .ipc(IpcRouter::new().register(Probe {
             calls: Arc::clone(&calls),
         }))
@@ -559,12 +559,10 @@ async fn the_ipc_endpoint_reaches_the_host_from_inside_the_container() {
         .expect("sandbox starts");
 
     let output = sandbox
-        .command(env!("CARGO_BIN_EXE_heel"))
-        .arg("ipc")
-        .arg("probe")
+        .command("probe")
         .output()
         .await
-        .expect("heel ipc runs");
+        .expect("the probe shim runs");
 
     assert!(
         output.status.success(),

@@ -6,8 +6,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use heel_shim::{CommandMeta, IpcError};
+
 use crate::ipc::command::{IpcCommand, IpcContext};
-use crate::ipc::protocol::IpcError;
 
 /// A registered handler, erased so that commands of different types can share
 /// one dispatch table.
@@ -16,18 +17,6 @@ type ErasedHandler = Arc<
         + Send
         + Sync,
 >;
-
-/// How a command's arguments may be written on the sandbox command line.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CommandMeta {
-    /// Argument names that may be given positionally, in order.
-    pub positional_args: Cow<'static, [Cow<'static, str>]>,
-    /// Argument that receives piped standard input, if any.
-    pub stdin_arg: Option<Cow<'static, str>>,
-    /// Whether every argument reaches the handler verbatim in `params["args"]`.
-    #[serde(default)]
-    pub raw_args: bool,
-}
 
 /// Whether a name is usable as a command or argument name.
 ///
@@ -55,8 +44,8 @@ fn check_identifier(kind: &str, value: &str) -> Result<(), String> {
 /// Check that `name` and `meta` describe a command a shim can be written for.
 fn check_command(name: &str, meta: &CommandMeta) -> Result<(), String> {
     check_identifier("command name", name)?;
-    if name == "heel" {
-        return Err("heel is reserved for the IPC launcher".to_owned());
+    if name == "heel-shim" {
+        return Err("heel-shim is reserved for the shim executable".to_owned());
     }
     for arg in meta.positional_args.iter() {
         check_identifier("positional argument name", arg)?;
@@ -77,7 +66,7 @@ fn check_command(name: &str, meta: &CommandMeta) -> Result<(), String> {
 /// A sandbox's command shims are written from this. It serializes as a map
 /// from command name to [`CommandMeta`], so a process that serves a router can
 /// hand its commands to a `heel` running elsewhere — `heel shims` inside a
-/// container — as one value. Deserializing checks every name and argument the
+/// container, with the `shim` feature — as one value. Deserializing checks every name and argument the
 /// way [`IpcRouter::register`] does, so a value of this type always describes
 /// shims that can be written.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -452,8 +441,8 @@ mod tests {
                 "invalid IPC command name 'bad/name'",
             ),
             (
-                r#"{"heel":{"positional_args":[],"stdin_arg":null}}"#,
-                "heel is reserved for the IPC launcher",
+                r#"{"heel-shim":{"positional_args":[],"stdin_arg":null}}"#,
+                "heel-shim is reserved for the shim executable",
             ),
             (
                 r#"{"search":{"positional_args":["$(id)"],"stdin_arg":null}}"#,

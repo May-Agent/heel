@@ -18,8 +18,10 @@ Platform support:
 ```
 .
 ├── Cargo.toml       # Library package and `heel` CLI binary
-├── src/bin/heel/    # CLI sources: `heel run`, `heel shell`, `heel python`, `heel ipc`, `heel shims`
-├── src/ipc/         # IPC: command trait, router, transport, command shims
+├── build.rs         # With the `shim` feature: produces the `heel-shim` executable heel embeds
+├── shim/            # `heel-shim`: the IPC wire protocol, client and the executable run inside a sandbox
+├── src/bin/heel/    # CLI sources: `heel run`, `heel shell`, `heel python`, `heel shims`
+├── src/ipc/         # IPC: command trait, router, server, command shims
 ├── src/platform/    # Per-platform backends behind the `Backend` trait
 ├── templates/       # Askama templates: the SBPL profile and the command shims
 ├── tests/           # Integration tests that assert the sandbox denies things
@@ -104,7 +106,7 @@ user. Never merge it automatically, and never hand-edit `version =` or
 
 - **SecurityConfig** (`src/security.rs`) - Fine-grained protection toggles (protect_user_home, protect_credentials, protect_cloud_config, etc.) and hardware access flags (allow_gpu, allow_npu, allow_hardware).
 
-- **IpcRouter** (`src/ipc/`) - Type-safe IPC over a Unix domain socket with MessagePack. Commands implement `IpcCommand`, whose name and argument shape are associated constants and whose per-request data is a separate `Args` type. Sandboxed processes see each command as a shim on `PATH` that execs `heel ipc`; all argument parsing happens there, in Rust. A process that runs where the router does not (a container reaching its host over `tcp://`) gets the same shims from `heel shims`, which writes them from a serialized `IpcCommands` through the same writer. A third route, `direct_ipc`, serves processes that link `IpcClient` and connect to `Sandbox::ipc_endpoint()` themselves: it writes no shims and needs no `heel` binary.
+- **IpcRouter** (`src/ipc/`) - Type-safe IPC over a Unix domain socket with MessagePack. Commands implement `IpcCommand`, whose name and argument shape are associated constants and whose per-request data is a separate `Args` type. Sandboxed processes see each command as a shim on `PATH` that execs the `heel-shim` executable the library embeds (the `shim` feature; `build.rs` builds it from `shim/` in a checkout and otherwise downloads the prebuilt executable of the shim version, building the published crate as a last resort); all argument parsing happens there, in Rust, and no `heel` executable is needed. A process that runs where the router does not (a container reaching its host over `tcp://`) gets the same shims from `heel shims`, which writes them from a serialized `IpcCommands` through the same writer. A third route, `direct_ipc`, serves processes that link `IpcClient` and connect to `Sandbox::ipc_endpoint()` themselves: it writes no shims and needs no executable. Only the Linux supervisor (`heel supervise`) still executes `heel` inside a sandbox, through `HeelBinary`.
 
 ### Key Patterns
 

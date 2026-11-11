@@ -1,0 +1,49 @@
+[package]
+name = "heel-shim"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The command shim and IPC client that run inside a heel sandbox"
+repository = "https://github.com/May-Agent/heel"
+keywords = ["sandbox", "ipc", "heel"]
+categories = ["os", "development-tools"]
+
+[lib]
+name = "heel_shim"
+
+[[bin]]
+name = "heel-shim"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Argument parsing of the shim binary.
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+humantime = { version = "2", default-features = false }
+
+# The wire protocol and the client.
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+rmp-serde = { version = "1", default-features = false }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+interprocess = { version = "2", default-features = false }
+
+# Resolving a TCP endpoint off the calling thread, and parsing its URI.
+blocking = { version = "1", default-features = false }
+futures-lite = { version = "2", default-features = false, features = ["std"] }
+http = { version = "1", default-features = false, features = ["std"] }
+
+[target."cfg(windows)".dependencies]
+# Names the pipe a sandbox's endpoint is bound to.
+sha2 = { version = "=0.10.9", default-features = false }
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }

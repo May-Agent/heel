@@ -9,12 +9,8 @@
 
 mod fixtures;
 
-use std::borrow::Cow;
 use std::process::Output;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use heel::ipc::{IpcCommand, IpcContext, IpcError, IpcRouter, NoArgs};
 use heel::{NetworkPolicy, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 /// Run `script` with `/bin/sh` inside `sandbox`.
@@ -148,70 +144,80 @@ async fn loopback_connects_directly_without_a_proxy() {
     assert!(output.status.success(), "{}", stderr(&output));
 }
 
-/// Echoes its arguments back, and counts how often it was called.
-struct Echo {
-    calls: Arc<AtomicUsize>,
-}
+#[cfg(feature = "shim")]
+mod ipc_route {
+    use std::borrow::Cow;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-impl IpcCommand for Echo {
-    fn name(&self) -> Cow<'static, str> {
-        "echo-args".into()
-    }
-    fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
-        Cow::Borrowed(&[Cow::Borrowed("first")])
-    }
+    use super::{sh, stderr, stdout};
+    use heel::ipc::{IpcCommand, IpcContext, IpcError, IpcRouter, NoArgs};
+    use heel::{Sandbox, SandboxConfigBuilder};
 
-    type Args = EchoArgs;
-    type Response = String;
-
-    async fn handle(&self, args: EchoArgs, _context: IpcContext) -> Result<String, IpcError> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        Ok(format!("first={}", args.first))
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct EchoArgs {
-    #[serde(default)]
-    first: String,
-}
-
-#[derive(Debug)]
-struct Structured;
-
-impl IpcCommand for Structured {
-    fn name(&self) -> Cow<'static, str> {
-        "structured".into()
+    /// Echoes its arguments back, and counts how often it was called.
+    struct Echo {
+        calls: Arc<AtomicUsize>,
     }
 
-    type Args = NoArgs;
-    type Response = Vec<u32>;
+    impl IpcCommand for Echo {
+        fn name(&self) -> Cow<'static, str> {
+            "echo-args".into()
+        }
+        fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+            Cow::Borrowed(&[Cow::Borrowed("first")])
+        }
 
-    async fn handle(&self, _args: NoArgs, _context: IpcContext) -> Result<Vec<u32>, IpcError> {
-        Ok(vec![1, 2, 3])
+        type Args = EchoArgs;
+        type Response = String;
+
+        async fn handle(&self, args: EchoArgs, _context: IpcContext) -> Result<String, IpcError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(format!("first={}", args.first))
+        }
     }
-}
 
-#[tokio::test]
-async fn ipc_commands_still_route_through_the_shims() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let router = IpcRouter::new()
-        .register(Echo {
-            calls: Arc::clone(&calls),
-        })
-        .register(Structured);
-    let config = SandboxConfigBuilder::default()
-        .host_access()
-        .ipc(router)
-        .heel_binary(heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"))
-        .build();
-    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
-        .await
-        .expect("sandbox starts");
+    #[derive(Debug, serde::Deserialize)]
+    struct EchoArgs {
+        #[serde(default)]
+        first: String,
+    }
 
-    let output = sh(&sandbox, "echo-args hello").await;
-    assert_eq!(stdout(&output), "first=hello", "{}", stderr(&output));
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    #[derive(Debug)]
+    struct Structured;
+
+    impl IpcCommand for Structured {
+        fn name(&self) -> Cow<'static, str> {
+            "structured".into()
+        }
+
+        type Args = NoArgs;
+        type Response = Vec<u32>;
+
+        async fn handle(&self, _args: NoArgs, _context: IpcContext) -> Result<Vec<u32>, IpcError> {
+            Ok(vec![1, 2, 3])
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_commands_still_route_through_the_shims() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = IpcRouter::new()
+            .register(Echo {
+                calls: Arc::clone(&calls),
+            })
+            .register(Structured);
+        let config = SandboxConfigBuilder::default()
+            .host_access()
+            .ipc(router)
+            .build();
+        let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("sandbox starts");
+
+        let output = sh(&sandbox, "echo-args hello").await;
+        assert_eq!(stdout(&output), "first=hello", "{}", stderr(&output));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 }
 
 #[cfg(target_os = "macos")]

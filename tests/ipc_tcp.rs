@@ -1,4 +1,5 @@
 #![doc = "External TCP IPC is relayed through a protected local socket without child TCP access."]
+#![cfg(feature = "shim")]
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -54,13 +55,15 @@ async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
     let listener = listener.expect("binds");
     let address = listener.local_addr().expect("address");
     let router = IpcRouter::new().register(Echo);
+    // The shims of a relayed router are written where the router is served and
+    // granted to the sandbox, as a container's are.
+    let shims = fixtures::tempdir();
+    router.commands().write_shims(shims.path()).expect("shims");
     let sandbox = Sandbox::with_config_and_executor(
         SandboxConfigBuilder::default()
             .executable(fixtures::resolved(&probe))
+            .executable(fixtures::resolved(shims.path()))
             .external_ipc(TcpIpcEndpoint::new(address, Duration::from_secs(5)))
-            .heel_binary(
-                heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"),
-            )
             .build(),
         executor_core::tokio::TokioGlobal,
     )
@@ -93,8 +96,15 @@ async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
     };
     let caller = async {
         sandbox
-            .command(env!("CARGO_BIN_EXE_heel"))
-            .args(["ipc", "echo", "--", "--message", "live-handler-ok"])
+            .command(
+                shims
+                    .path()
+                    .join("echo")
+                    .with_extension(std::env::consts::EXE_EXTENSION)
+                    .to_str()
+                    .expect("fixture path is UTF-8"),
+            )
+            .args(["--message", "live-handler-ok"])
             .env("HEEL_IPC_ENDPOINT", "tcp://127.0.0.1:1")
             .output()
             .await

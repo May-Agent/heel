@@ -1,4 +1,4 @@
-//! The `heel` binary that IPC shims and the supervisor execute.
+//! The `heel` binary the Linux supervisor executes.
 
 use std::path::{Path, PathBuf};
 
@@ -6,8 +6,9 @@ use crate::error::{Error, Result};
 
 /// A `heel` binary known to be the library's own version.
 ///
-/// The binary is the IPC client inside the sandbox and speaks the request
-/// frame of its own release, so a stale one fails every IPC command. Both
+/// The binary is what `heel supervise` runs as inside the sandbox, and it
+/// speaks the supervisor protocol of its own release, so a stale one fails
+/// every supervised command. Both
 /// constructors run the binary with `--version` and refuse a mismatch; holding
 /// a `HeelBinary` is the proof that the check passed. Verify once and share the
 /// value: a configuration that carries one does no lookup and no check when a
@@ -64,7 +65,7 @@ impl HeelBinary {
 
         let found = search_path_for_binary(&binary_name).ok_or_else(|| {
             Error::InitFailed(format!(
-                "cannot find the '{binary_name}' binary, which sandboxed IPC commands execute; \
+                "cannot find the '{binary_name}' binary, which the supervisor executes; \
                  install it with `cargo install heel` or point HEEL_BIN at it"
             ))
         })?;

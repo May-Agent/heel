@@ -6,7 +6,9 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use heel::{Error, HeelBinary, Sandbox, SandboxConfigBuilder};
+use heel::{Error, HeelBinary};
+#[cfg(target_os = "linux")]
+use heel::{Sandbox, SandboxConfigBuilder};
 
 fn assert_names_both_versions(error: &Error) {
     let Error::InitFailed(message) = error else {
@@ -29,23 +31,29 @@ fn a_stale_binary_fails_verification_and_lookup() {
     let error = HeelBinary::verify(&stale).expect_err("a mismatched binary is refused");
     assert_names_both_versions(&error);
 
-    // A configuration without a binary looks one up, and the lookup verifies.
     // SAFETY: nothing else runs in this process yet, so no thread reads the
     // environment while it is changed.
     unsafe { std::env::set_var("HEEL_BIN", &stale) };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let error = runtime
-        .block_on(async {
-            let config = SandboxConfigBuilder::default()
-                .ipc(heel::IpcRouter::new())
-                .build();
-            Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal).await
-        })
-        .err()
-        .expect("sandbox creation refuses the stale HEEL_BIN");
-    assert_names_both_versions(&error);
+
+    // The supervisor is the one thing that still runs `heel` inside a sandbox:
+    // a configuration that asks for it looks a binary up, and the lookup
+    // verifies.
+    #[cfg(target_os = "linux")]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(async {
+                let config = SandboxConfigBuilder::default()
+                    .supervised_spawn(true)
+                    .build();
+                Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal).await
+            })
+            .err()
+            .expect("sandbox creation refuses the stale HEEL_BIN");
+        assert_names_both_versions(&error);
+    }
 
     let error = HeelBinary::locate().expect_err("locate refuses it too");
     assert_names_both_versions(&error);
