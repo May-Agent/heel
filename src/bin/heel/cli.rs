@@ -22,7 +22,7 @@ impl Cli {
             Commands::Run(args) => args.common.verbose,
             Commands::Shell(args) => args.common.verbose,
             Commands::Python(args) => args.common.verbose,
-            Commands::Ipc(args) => args.verbose,
+            #[cfg(feature = "shim")]
             Commands::Shims(args) => args.verbose,
             #[cfg(target_os = "linux")]
             Commands::Supervise(_) => false,
@@ -41,10 +41,8 @@ pub enum Commands {
     /// Run Python in the sandbox, or a REPL when no script is given.
     Python(PythonArgs),
 
-    /// Invoke a host IPC command from inside a sandbox.
-    Ipc(IpcArgs),
-
     /// Write the shims of IPC commands served elsewhere into a directory.
+    #[cfg(feature = "shim")]
     Shims(ShimsArgs),
 
     /// Run a command as the root of its process tree and own that tree.
@@ -167,10 +165,11 @@ impl PythonArgs {
 /// Write IPC command shims for a process that runs where the router does not.
 ///
 /// A container reaching its host's router writes them with this before running
-/// the process: the directory then holds one program per command and a `heel`
-/// launcher for this binary, and with it on `PATH` and `HEEL_IPC_ENDPOINT`
-/// naming the router (`tcp://host:port`), or a sandbox's relay of it, the
-/// commands run as they do in a sandbox on the host.
+/// the process: the directory then holds one program per command and the
+/// `heel-shim` executable they run, and with it on `PATH` and
+/// `HEEL_IPC_ENDPOINT` naming the router (`tcp://host:port`), or a sandbox's
+/// relay of it, the commands run as they do in a sandbox on the host.
+#[cfg(feature = "shim")]
 #[derive(Args)]
 pub struct ShimsArgs {
     /// Directory to write the shims into, created owner-only if missing.
@@ -186,43 +185,9 @@ pub struct ShimsArgs {
     pub verbose: bool,
 }
 
+#[cfg(feature = "shim")]
 fn parse_ipc_commands(value: &str) -> Result<heel::ipc::IpcCommands, serde_json::Error> {
     serde_json::from_str(value)
-}
-
-/// Invoke a host command over the sandbox IPC socket.
-///
-/// The generated command shims call this; the metadata flags come from the
-/// command's declaration on the host, so all argument handling happens here
-/// rather than in shell script.
-#[derive(Args)]
-pub struct IpcArgs {
-    /// TCP IPC connection and request deadline.
-    #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
-    pub timeout: std::time::Duration,
-
-    /// IPC command name to invoke.
-    pub command: String,
-
-    /// Argument name that may be given positionally; repeated, in order.
-    #[arg(long = "positional")]
-    pub positional: Vec<String>,
-
-    /// Forward every argument verbatim in `args` for the host-side parser.
-    #[arg(long = "raw-args")]
-    pub raw_args: bool,
-
-    /// Argument name that receives piped standard input.
-    #[arg(long = "stdin-arg")]
-    pub stdin_arg: Option<String>,
-
-    /// Enable verbose output.
-    #[arg(short, long)]
-    pub verbose: bool,
-
-    /// Arguments forwarded to the IPC command.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
 }
 
 /// Arguments shared by the sandboxing subcommands.
@@ -654,31 +619,5 @@ mod tests {
             panic!("a grant without a path must be rejected");
         };
         assert!(error.to_string().contains("expected PATH=MODE"), "{error}");
-    }
-
-    #[test]
-    fn ipc_metadata_is_separated_from_forwarded_arguments() {
-        let cli = Cli::try_parse_from([
-            "heel",
-            "ipc",
-            "search",
-            "--positional",
-            "query",
-            "--stdin-arg",
-            "input",
-            "--",
-            "rust",
-            "--limit",
-            "3",
-        ])
-        .expect("parses");
-        let Commands::Ipc(args) = cli.command else {
-            panic!("expected ipc");
-        };
-
-        assert_eq!(args.command, "search");
-        assert_eq!(args.positional, ["query"]);
-        assert_eq!(args.stdin_arg.as_deref(), Some("input"));
-        assert_eq!(args.args, ["rust", "--limit", "3"]);
     }
 }

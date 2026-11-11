@@ -172,6 +172,7 @@ pub fn resolve_paths<T>(
 ///
 /// The path may be spelled through links (a package manager's shim), but not
 /// through one the sandbox could plant: one inside a writable directory.
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn resolve_outside(path: &Path, writable: &[PathBuf]) -> Result<ResolvedPath> {
     let walk = walk(path, false)?;
     let mut anchors = Vec::new();
@@ -650,6 +651,7 @@ mod tests {
         assert!(!walked.starts_with(root.join("alias")));
     }
 
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_path_outside_the_writable_directories_is_resolved_for_the_host() {
         let (_guard, root) = root();

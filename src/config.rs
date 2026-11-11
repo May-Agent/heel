@@ -344,7 +344,7 @@ pub struct SandboxConfigData {
     /// Path of the IPC socket, once the server is listening. `None` disables IPC.
     ipc_socket: Option<PathBuf>,
     ipc_bin_dir: Option<PathBuf>,
-    /// Explicit path to the `heel` binary that IPC shims execute.
+    /// Explicit path to the `heel` binary the Linux supervisor executes.
     heel_binary: Option<crate::binary::HeelBinary>,
     external_ipc: Option<crate::ipc::TcpIpcEndpoint>,
     allow_tty_write: bool,
@@ -416,6 +416,7 @@ impl SandboxConfigData {
     /// Every path this configuration lets the sandbox write: the writable
     /// grants, the writable persistent grants of an identity, the working
     /// directory and a virtual environment that accepts installs.
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn writable_paths(&self) -> Vec<PathBuf> {
         self.grants
             .iter()
@@ -508,6 +509,7 @@ impl SandboxConfigData {
         self.ipc_bin_dir.as_deref()
     }
 
+    #[cfg(feature = "shim")]
     pub(crate) fn set_ipc_bin_dir(&mut self, path: PathBuf) {
         self.ipc_bin_dir = Some(path);
     }
@@ -605,17 +607,20 @@ impl SandboxConfigData {
 /// The route is stored with the router, so "a router without a route" and
 /// "a route without a router" cannot be built.
 pub(crate) enum IpcRoute {
-    /// Command shims on `PATH` that run the `heel` binary.
+    /// Command shims on `PATH` that run the embedded `heel-shim` executable.
+    #[cfg(feature = "shim")]
     Shimmed(IpcRouter),
     /// Processes that link [`IpcClient`](crate::IpcClient) connect themselves:
-    /// no shims and no `heel` binary.
+    /// no shims and no executable to write.
     Direct(IpcRouter),
 }
 
 impl IpcRoute {
     fn router(&self) -> &IpcRouter {
         match self {
-            Self::Shimmed(router) | Self::Direct(router) => router,
+            #[cfg(feature = "shim")]
+            Self::Shimmed(router) => router,
+            Self::Direct(router) => router,
         }
     }
 }
@@ -957,9 +962,14 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N, IpcUnconfigured> {
 
     /// Expose host-side commands to sandboxed processes over IPC.
     ///
+    /// Each command is a program on the sandbox's `PATH` that runs the
+    /// `heel-shim` executable this library embeds; nothing else needs to be
+    /// installed.
+    ///
     /// # IPC state
     ///
     /// Selects the sole IPC route; a configured builder cannot select another.
+    #[cfg(feature = "shim")]
     pub fn ipc(mut self, router: IpcRouter) -> SandboxConfigBuilder<N, IpcConfigured> {
         self.ipc = Some(IpcRoute::Shimmed(router));
         self.configured()
@@ -1008,7 +1018,9 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N, IpcUnconfigured> {
 }
 
 impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
-    /// Use a specific `heel` binary for the generated IPC command shims.
+    /// Use a specific `heel` binary for the Linux supervisor
+    /// ([`supervised_spawn`](Self::supervised_spawn)), the one thing that still
+    /// executes `heel` inside a sandbox.
     ///
     /// The binary is already verified to match the library's version
     /// ([`HeelBinary::verify`](crate::HeelBinary::verify)), so creating a

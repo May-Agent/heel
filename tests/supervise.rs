@@ -10,6 +10,8 @@ use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
+mod fixtures;
+
 use heel::supervisor::{Background, Foreground};
 use heel::{Error, Sandbox, SandboxConfigBuilder};
 
@@ -323,6 +325,52 @@ async fn killing_a_tree_that_has_already_ended_is_not_an_error() {
         .await
         .expect("an ended tree is already killed");
     assert!(report.killed.is_empty() && report.survivors.is_empty());
+}
+
+#[tokio::test]
+async fn a_heel_binary_reached_through_a_link_is_used() {
+    // A package manager's shim: the binary the host picks is a link.
+    let dir = fixtures::tempdir();
+    let link = dir.path().join("heel");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_heel"), &link).expect("links");
+    let config = SandboxConfigBuilder::default()
+        .heel_binary(heel::HeelBinary::verify(&link).expect("matching binary"))
+        .supervised_spawn(true)
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("a heel binary behind a link builds");
+
+    let mut child = sandbox
+        .command("/bin/true")
+        .spawn_supervised(Background { reap_timeout: REAP })
+        .await
+        .expect("spawns");
+    let status = bounded("the command", child.wait()).await.unwrap();
+
+    assert!(status.success(), "{status:?}");
+}
+
+#[tokio::test]
+async fn a_heel_binary_link_the_sandbox_could_plant_is_refused() {
+    let dir = fixtures::tempdir();
+    let link = dir.path().join("heel");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_heel"), &link).expect("links");
+    let config = SandboxConfigBuilder::default()
+        .writable(fixtures::resolved(dir.path()))
+        .heel_binary(heel::HeelBinary::verify(&link).expect("matching binary"))
+        .supervised_spawn(true)
+        .build();
+
+    let error = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .err()
+        .expect("a link below a writable path is refused");
+
+    assert!(
+        matches!(&error, Error::GrantRedirected { path, .. } if *path == link),
+        "{error:?}"
+    );
 }
 
 /// A command that leaves a `setsid` helper behind and stays in the foreground.

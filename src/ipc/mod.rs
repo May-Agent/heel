@@ -51,24 +51,25 @@
 //! Inside the sandbox, `web_search "rust sandboxing"` then reaches the host
 //! handler with `query` populated.
 
-mod client;
 mod command;
-mod endpoint;
-mod protocol;
+mod paths;
 mod router;
 pub(crate) mod server;
 mod tcp;
+#[cfg(feature = "shim")]
 mod wrappers;
 
-pub use client::IpcClient;
+// The wire protocol, the client and the endpoint's naming live in `heel-shim`,
+// which the sandboxed side runs; they stay reachable at these paths.
 pub use command::{IpcCommand, IpcContext, NoArgs};
-pub use protocol::{IpcError, IpcRequest, IpcResponse};
-pub use router::{CommandMeta, IpcCommands, IpcRouter};
-pub use tcp::TcpIpcEndpoint;
-pub use wrappers::{HEEL_DIR_NAME, SOCKET_NAME, WRAPPER_DIR_NAME};
+pub use heel_shim::{CommandMeta, IpcClient, IpcError, IpcRequest, IpcResponse, TcpIpcEndpoint};
+pub use paths::{HEEL_DIR_NAME, SOCKET_NAME, WRAPPER_DIR_NAME};
+pub use router::{IpcCommands, IpcRouter};
 
 // Internal to the sandbox lifecycle, not part of the public surface.
 #[cfg(windows)]
-pub(crate) use endpoint::pipe_name;
+pub(crate) use heel_shim::endpoint::pipe_name;
+pub(crate) use paths::socket_root;
 pub(crate) use server::IpcServer;
-pub(crate) use wrappers::{IpcLayout, socket_root};
+#[cfg(feature = "shim")]
+pub(crate) use wrappers::IpcLayout;

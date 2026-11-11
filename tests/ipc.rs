@@ -1,16 +1,14 @@
 //! End-to-end IPC: a sandboxed process calling host commands.
 //!
-//! The sandboxed side runs the real `heel ipc` binary through the generated
-//! command shims, so these cover the whole path: shim, argument parsing,
-//! transport, dispatch and rendering.
+//! The sandboxed side runs the real `heel-shim` executable the library embeds
+//! through the generated command shims, so these cover the whole path: shim,
+//! argument parsing, transport, dispatch and rendering.
 
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(all(feature = "shim", any(target_os = "macos", target_os = "linux")))]
 
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-mod fixtures;
 
 use heel::ipc::{IpcCommand, IpcContext, IpcError, IpcRouter, NoArgs};
 use heel::{Sandbox, SandboxConfigBuilder};
@@ -75,12 +73,9 @@ impl IpcCommand for Structured {
     }
 }
 
-/// Build a sandbox whose shims run the binary this test suite just built.
+/// Build a sandbox whose shims run the shim executable the library embeds.
 async fn sandbox_with(router: IpcRouter) -> Sandbox {
-    let config = SandboxConfigBuilder::default()
-        .ipc(router)
-        .heel_binary(heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"))
-        .build();
+    let config = SandboxConfigBuilder::default().ipc(router).build();
 
     Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -295,44 +290,19 @@ async fn the_shim_directory_is_the_only_executable_place_in_the_working_director
 }
 
 #[tokio::test]
-async fn a_heel_binary_reached_through_a_link_is_used() {
-    // A package manager's shim: the binary the host picks is a link.
-    let dir = fixtures::tempdir();
-    let link = dir.path().join("heel");
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_heel"), &link).expect("links");
-    let config = SandboxConfigBuilder::default()
-        .ipc(IpcRouter::new().register(Structured))
-        .heel_binary(heel::HeelBinary::verify(&link).expect("matching binary"))
-        .build();
-    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
-        .await
-        .expect("a heel binary behind a link builds");
+async fn the_shim_executable_is_not_writable_from_inside_the_sandbox() {
+    let sandbox = sandbox_with(IpcRouter::new().register(Structured)).await;
+    let bin_dir = sandbox.config().ipc_bin_dir().expect("shims are written");
+    let shim = bin_dir.join("heel-shim");
 
-    let output = sh(&sandbox, "structured").await;
-
-    assert!(output.status.success(), "{}", stderr(&output));
-}
-
-#[tokio::test]
-async fn a_heel_binary_link_the_sandbox_could_plant_is_refused() {
-    let dir = fixtures::tempdir();
-    let link = dir.path().join("heel");
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_heel"), &link).expect("links");
-    let config = SandboxConfigBuilder::default()
-        .ipc(IpcRouter::new().register(Structured))
-        .writable(fixtures::resolved(dir.path()))
-        .heel_binary(heel::HeelBinary::verify(&link).expect("matching binary"))
-        .build();
-
-    let error = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
-        .await
-        .err()
-        .expect("a link below a writable path is refused");
-
-    assert!(
-        matches!(&error, heel::Error::GrantRedirected { path, .. } if *path == link),
-        "{error:?}"
-    );
+    let before = std::fs::read(&shim).expect("the shim executable exists");
+    let output = sh(
+        &sandbox,
+        &format!("printf tampered >> '{}'", shim.display()),
+    )
+    .await;
+    assert!(!output.status.success(), "the shim was written to");
+    assert_eq!(std::fs::read(&shim).expect("still there"), before);
 }
 
 /// Reports the working directory the host handler received with the call.

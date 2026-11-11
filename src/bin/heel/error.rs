@@ -27,17 +27,6 @@ pub enum CliError {
         source: Box<toml::de::Error>,
     },
 
-    #[cfg(windows)]
-    #[error("failed to decode native IPC metadata at {path}: {source}")]
-    NativeMetadata {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-
-    #[cfg(windows)]
-    #[error("native IPC entrypoint has no UTF-8 command name")]
-    InvalidNativeCommand,
-
     #[error("invalid --env value (expected KEY=VALUE): {value}")]
     InvalidEnvFormat { value: String },
 
@@ -63,30 +52,10 @@ pub enum CliError {
     AuditLogWithoutProxy,
 
     #[error(
-        "HEEL_IPC_ENDPOINT is not set; `heel ipc` runs inside a sandbox that has IPC configured"
-    )]
-    MissingIpcEndpoint,
-
-    #[error(
         "--isolation host runs the process with the invoking user's full access, which an explicit --network deny contradicts"
     )]
     HostAccessWithDeny,
 
     #[error("IPC error: {0}")]
     Ipc(#[from] heel::IpcError),
-
-    #[error("failed to encode IPC arguments: {0}")]
-    EncodeIpcArgs(#[from] rmp_serde::encode::Error),
-
-    #[error("failed to decode the IPC response: {0}")]
-    DecodeIpcResponse(#[from] rmp_serde::decode::Error),
-
-    #[error("failed to render the IPC response: {0}")]
-    RenderIpcResponse(#[from] serde_json::Error),
-
-    #[error("{command} takes no positional argument here: {value}")]
-    UnexpectedPositional { command: String, value: String },
-
-    #[error("{command} received an argument that is not --name or --name=value: {value}")]
-    UnexpectedArgument { command: String, value: String },
 }

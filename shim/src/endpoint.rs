@@ -20,7 +20,7 @@ use interprocess::local_socket::Name;
 
 /// Build the local socket name for `path`.
 #[cfg(unix)]
-pub(crate) fn name(path: &Path) -> io::Result<Name<'static>> {
+pub fn name(path: &Path) -> io::Result<Name<'static>> {
     use interprocess::local_socket::{GenericFilePath, ToFsName};
 
     path.to_path_buf().to_fs_name::<GenericFilePath>()
@@ -28,7 +28,7 @@ pub(crate) fn name(path: &Path) -> io::Result<Name<'static>> {
 
 /// Build the local socket name for `path`.
 #[cfg(windows)]
-pub(crate) fn name(path: &Path) -> io::Result<Name<'static>> {
+pub fn name(path: &Path) -> io::Result<Name<'static>> {
     use interprocess::local_socket::{GenericNamespaced, ToNsName};
 
     pipe_name(path).to_ns_name::<GenericNamespaced>()
@@ -39,7 +39,7 @@ pub(crate) fn name(path: &Path) -> io::Result<Name<'static>> {
 /// The complete native path is hashed so nested socket directories preserve
 /// sandbox identity within the system-wide pipe namespace.
 #[cfg(windows)]
-pub(crate) fn pipe_name(path: &Path) -> String {
+pub fn pipe_name(path: &Path) -> String {
     use sha2::{Digest, Sha256};
     use std::os::windows::ffi::OsStrExt;
 
