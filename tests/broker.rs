@@ -1278,6 +1278,9 @@ struct Sentinels {
     directory: tempfile::TempDir,
     _files: Vec<std::fs::File>,
     paths: Vec<PathBuf>,
+    /// The numbers the process already had open, which whatever started it
+    /// left there.
+    inherited: Vec<i32>,
 }
 
 /// What a sentinel looks like from outside, including everything the broker's
@@ -1321,6 +1324,9 @@ impl Sentinels {
             assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit), 0);
         }
         let directory = fixtures::tempdir();
+        let inherited = (3..=Self::LAST)
+            .filter(|number| std::fs::read_link(format!("/proc/self/fd/{number}")).is_ok())
+            .collect();
         let mut files = Vec::new();
         let mut paths = Vec::new();
         loop {
@@ -1344,6 +1350,7 @@ impl Sentinels {
             directory,
             _files: files,
             paths,
+            inherited,
         }
     }
 
@@ -1351,11 +1358,12 @@ impl Sentinels {
         self.paths.iter().map(|path| fingerprint(path)).collect()
     }
 
-    /// Descriptors 3 through the last are all sentinels.
+    /// Descriptors 3 through the last are all sentinels, but for the ones the
+    /// process was started with.
     #[track_caller]
     fn assert_dense(&self) {
         let directory = self.directory.path().canonicalize().unwrap();
-        for number in 3..=Self::LAST {
+        for number in (3..=Self::LAST).filter(|number| !self.inherited.contains(number)) {
             let target = std::fs::read_link(format!("/proc/self/fd/{number}"));
             assert!(
                 target
@@ -1926,16 +1934,24 @@ async fn sandbox_dropped_with_a_descendant_waiting<N: NetworkPolicy>(
     sandbox: Sandbox<N>,
     go: &Path,
     then: &str,
-) {
+) -> Descendant {
     let output = sh(
         &sandbox,
         &format!(
-            "(setsid sh -c 'while [ ! -e \"{0}\" ]; do sleep 0.1; done; {then}' </dev/null >/dev/null 2>&1 &); echo started",
+            "(setsid sh -c 'echo $$ > \"{0}.pid\"; while [ ! -e \"{0}\" ]; do sleep 0.1; done; {then}' </dev/null >/dev/null 2>&1 &); \
+             while [ ! -s \"{0}.pid\" ]; do sleep 0.05; done; echo started",
             go.display()
         ),
     )
     .await;
     assert_eq!(stdout(&output), "started", "{}", text(&output));
+    let descendant = Descendant(
+        std::fs::read_to_string(go.with_extension("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
     drop(sandbox);
     // The launcher and the home thread end with the sandbox; the descendant has
     // not been told to go yet, so everything it does is after they are gone.
@@ -1952,6 +1968,31 @@ async fn sandbox_dropped_with_a_descendant_waiting<N: NetworkPolicy>(
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     std::fs::write(go, "").unwrap();
+    descendant
+}
+
+/// The process a sandbox left behind, by its pid in this namespace.
+struct Descendant(i32);
+
+impl Descendant {
+    /// Where the process is now, for a failure to say: its state, the system
+    /// call it is in, and the broker's threads that are left to serve it.
+    fn whereabouts(&self) -> String {
+        let read = |name: &str| {
+            std::fs::read_to_string(format!("/proc/{}/{name}", self.0))
+                .unwrap_or_else(|error| format!("<{error}>"))
+        };
+        let state = read("status")
+            .lines()
+            .find(|line| line.starts_with("State:"))
+            .map_or_else(|| read("status"), str::to_owned);
+        format!(
+            "pid {}: {state}; syscall {}; broker threads {:?}",
+            self.0,
+            read("syscall").trim(),
+            broker_threads()
+        )
+    }
 }
 
 #[tokio::test]
@@ -2233,7 +2274,7 @@ async fn a_descendant_that_outlives_the_sandbox_is_served_until_it_ends() {
     let (_guard, root) = home(&[".ssh/id_ed25519"]);
     let written = root.join("scratch/after-drop");
     let sandbox = start(protected(DenyAll, &root, &probe)).await;
-    sandbox_dropped_with_a_descendant_waiting(
+    let descendant = sandbox_dropped_with_a_descendant_waiting(
         sandbox,
         &root.join("scratch/go"),
         &format!("echo served > \"{}\"", written.display()),
@@ -2243,7 +2284,8 @@ async fn a_descendant_that_outlives_the_sandbox_is_served_until_it_ends() {
     while std::fs::read_to_string(&written).unwrap_or_default().trim() != "served" {
         assert!(
             std::time::Instant::now() < deadline,
-            "a descendant that outlived the sandbox lost its broker"
+            "a descendant that outlived the sandbox lost its broker: {}",
+            descendant.whereabouts()
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
