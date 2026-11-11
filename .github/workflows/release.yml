@@ -21,6 +21,11 @@ jobs:
     name: Release
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+      actions: write
     outputs:
       releases_created: ${{ steps.release.outputs.releases_created }}
       heel_tag: ${{ steps.release_tags.outputs.heel_tag }}
@@ -40,6 +45,18 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+      # A PR pushed with GITHUB_TOKEN triggers no pull_request workflows, so
+      # the required `CI result` runs through workflow_dispatch on the PR's
+      # head.
+      - name: Run CI on the release PR
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          PR: ${{ steps.release.outputs.pr }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          head=$(jq -er '.head_branch' <<<"$PR")
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$head"
       - name: Resolve released tags
         id: release_tags
         if: steps.release.outputs.releases_created == 'true'
