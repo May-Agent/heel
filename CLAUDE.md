@@ -71,24 +71,17 @@ generator wrote what it was told to.
 
 ## Releasing
 
-Publishing takes **two merges**, and only the second one publishes:
-
-1. Merge the content into `main`. This publishes nothing.
-2. release-plz then opens a PR of its own, titled `chore: release vX.Y.Z`, which
-   bumps the version and writes the changelog. Merging **that** is what runs
-   `cargo publish`.
-
-Stopping after the first merge leaves the release un-published while looking
-finished, which matters most when a security fix is riding on it. Confirm on
-crates.io rather than from the merge:
+`main` is the only long-lived branch: topic branches start from `origin/main`
+and merge into it through the merge queue, whose required check is `CI result`.
+release-plz keeps a release PR against `main` open; merging it publishes. Confirm
+on crates.io rather than from the merge:
 
 ```bash
 curl -s -H 'User-Agent: heel' https://crates.io/api/v1/crates/heel | grep -o '"max_version":"[^"]*"'
 ```
 
-`cargo publish` is irreversible, so the merge of the release PR belongs to the
-user. Never merge it automatically, and never hand-edit `version =` or
-`CHANGELOG.md`: release-plz derives both from conventional-commit messages.
+`cargo publish` is irreversible. Never hand-edit `version =` or `CHANGELOG.md`:
+release-plz derives both from conventional-commit messages.
 
 ## Architecture
 
