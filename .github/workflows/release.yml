@@ -45,18 +45,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-      # A PR pushed with GITHUB_TOKEN triggers no pull_request workflows, so
-      # the required `CI result` runs through workflow_dispatch on the PR's
-      # head.
-      - name: Run CI on the release PR
+      # GitHub holds the pull request runs of a pull request the Actions bot
+      # opened or pushed until they are approved, and the required
+      # `CI result` reports on the pull request only from those runs.
+      - name: Approve the release PR's CI
         if: steps.release.outputs.prs_created == 'true'
         env:
           PR: ${{ steps.release.outputs.pr }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          head=$(jq -er '.head_branch' <<<"$PR")
-          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$head"
+        run: bash .github/scripts/approve-held-runs.sh "$(jq -er .number <<<"$PR")"
       - name: Resolve released tags
         id: release_tags
         if: steps.release.outputs.releases_created == 'true'
