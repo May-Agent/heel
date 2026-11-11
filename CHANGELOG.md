@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6](https://github.com/May-Agent/heel/compare/heel-v0.9.5...heel-v0.9.6) - 2026-11-11
+
+### Fixed
+
+- *(windows)* open the mount manager to the container for queries
+
+### Other
+
+- *(windows)* carry the probe report in the assertion only
+- *(windows)* take canonicalize apart inside the sandbox
+
 ## [0.9.5](https://github.com/May-Agent/heel/compare/heel-v0.9.4...heel-v0.9.5) - 2026-11-10
 
 ### Added
