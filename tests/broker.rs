@@ -1935,6 +1935,15 @@ async fn sandbox_dropped_with_a_descendant_waiting<N: NetworkPolicy>(
     go: &Path,
     then: &str,
 ) -> Descendant {
+    // The broker reads a caller's memory, which Yama's `ptrace_scope` 1 allows
+    // only for a descendant. The descendant here outlives the sandbox's root
+    // process, so it stays this process's descendant only if this process
+    // adopts it: an embedder that wants to serve such a process is a subreaper.
+    // SAFETY: `prctl` takes integers by value.
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0
+    );
     let output = sh(
         &sandbox,
         &format!(
