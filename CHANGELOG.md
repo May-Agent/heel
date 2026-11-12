@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/May-Agent/heel/compare/heel-v0.10.1...heel-v0.10.2) - 2026-11-12
+
+### Other
+
+- *(linux)* skip a broker thread that ends while its table is read
+- *(linux)* report why a broker thread's descriptor table cannot be read
+
 ## [0.10.1](https://github.com/May-Agent/heel/compare/heel-v0.10.0...heel-v0.10.1) - 2026-11-12
 
 ### Fixed
