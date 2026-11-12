@@ -1546,19 +1546,28 @@ fn serving_threads() -> Vec<(PathBuf, String)> {
         .collect()
 }
 
-/// What a thread's descriptor table holds, as the links say.
+/// What a thread's descriptor table holds, as the links say. A descriptor
+/// closed between listing the table and reading its link is skipped; any
+/// other failure to read the table fails the test with its error.
 fn table_of(task: &Path) -> Vec<(i32, PathBuf)> {
-    std::fs::read_dir(task.join("fd"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| {
-                    let number = entry.file_name().to_str()?.parse().ok()?;
-                    Some((number, std::fs::read_link(entry.path()).ok()?))
-                })
-                .collect()
+    let directory = task.join("fd");
+    std::fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("cannot open {}: {error}", directory.display()))
+        .filter_map(|entry| {
+            let entry = entry
+                .unwrap_or_else(|error| panic!("cannot list {}: {error}", directory.display()));
+            let number = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+                .unwrap_or_else(|| panic!("{:?} is no descriptor number", entry.file_name()));
+            match std::fs::read_link(entry.path()) {
+                Ok(target) => Some((number, target)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot read {}: {error}", entry.path().display()),
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 #[tokio::test]
