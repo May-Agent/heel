@@ -103,6 +103,27 @@ fn text(output: &Output) -> String {
     format!("{} {}", stdout(output), stderr(output))
 }
 
+/// A file the broker opens for writing is closed on the broker's side before
+/// the caller resumes, so a script just written and made executable runs at
+/// once instead of failing with `ETXTBSY`. The window was a few instructions
+/// wide, so the shell repeats the cycle to make a regression show.
+#[tokio::test]
+async fn a_script_written_through_the_broker_runs_at_once() {
+    let probe = probe();
+    let (_guard, root) = home(&[".ssh/id_ed25519"]);
+    let sandbox = start(protected(DenyAll, &root, &probe).executable_working_dir(true)).await;
+
+    let output = sh(
+        &sandbox,
+        "i=0; while [ \"$i\" -lt 200 ]; do \
+         printf '#!/bin/sh\\necho ok\\n' > run.sh && chmod +x run.sh && ./run.sh > /dev/null \
+         || exit 1; i=$((i + 1)); done; echo done",
+    )
+    .await;
+
+    assert_eq!(stdout(&output), "done", "{}", stderr(&output));
+}
+
 #[tokio::test]
 async fn missing_persistence_files_cannot_be_created_by_any_route() {
     let probe = probe();

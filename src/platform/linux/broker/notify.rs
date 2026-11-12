@@ -157,9 +157,15 @@ impl Listener {
             Reply::Errno(errno) => self.send(id, 0, -errno, 0),
             Reply::Continue => self.send(id, 0, 0, libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32),
             Reply::Fd { fd, cloexec } => {
+                // The descriptor is installed without `SECCOMP_ADDFD_FLAG_SEND`,
+                // so the caller stays stopped until the answer below: the
+                // broker's own copy must be closed first, or a file the caller
+                // just wrote is still open for writing here and its `execve`
+                // fails with `ETXTBSY`. The filter's `WAIT_KILLABLE_RECV` keeps
+                // the caller waiting across both steps.
                 let mut request = libc::seccomp_notif_addfd {
                     id,
-                    flags: libc::SECCOMP_ADDFD_FLAG_SEND as u32,
+                    flags: 0,
                     srcfd: u32::try_from(fd.as_raw_fd()).map_err(io::Error::other)?,
                     newfd: 0,
                     newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
@@ -172,8 +178,9 @@ impl Listener {
                         &raw mut request,
                     )
                 };
+                drop(fd);
                 match cvt(result) {
-                    Ok(_) => Ok(()),
+                    Ok(installed) => self.send(id, i64::from(installed), 0, 0),
                     // The task is gone, so there is nobody to answer.
                     Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Err(error),
                     // The descriptor could not be installed, which leaves the
