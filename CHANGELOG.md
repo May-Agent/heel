@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/May-Agent/heel/compare/heel-v0.10.0...heel-v0.10.1) - 2026-11-12
+
+### Fixed
+
+- *(linux)* close the broker's copy of an opened file before the caller resumes
+
+### Other
+
+- the release PR is never set to merge automatically
+
 ## [0.10.0](https://github.com/May-Agent/heel/compare/heel-v0.9.7...heel-v0.10.0) - 2026-11-11
 
 ### Added
