@@ -1546,19 +1546,50 @@ fn serving_threads() -> Vec<(PathBuf, String)> {
         .collect()
 }
 
-/// What a thread's descriptor table holds, as the links say.
-fn table_of(task: &Path) -> Vec<(i32, PathBuf)> {
-    std::fs::read_dir(task.join("fd"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| {
-                    let number = entry.file_name().to_str()?.parse().ok()?;
-                    Some((number, std::fs::read_link(entry.path()).ok()?))
-                })
-                .collect()
+/// What a thread's descriptor table holds, as the links say, or `None` once
+/// the thread has ended: a spare worker leaves when it is no longer needed,
+/// and an ending thread's table reads empty before its task goes. A
+/// descriptor closed between listing the table and reading its link is
+/// skipped; any other failure to read the table fails the test with its
+/// error, and so does an empty table of a thread that keeps running.
+fn table_of(task: &Path) -> Option<Vec<(i32, PathBuf)>> {
+    let directory = task.join("fd");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("cannot open {}: {error}", directory.display()),
+    };
+    let table: Vec<(i32, PathBuf)> = entries
+        .filter_map(|entry| {
+            let entry = entry
+                .unwrap_or_else(|error| panic!("cannot list {}: {error}", directory.display()));
+            let number = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+                .unwrap_or_else(|| panic!("{:?} is no descriptor number", entry.file_name()));
+            match std::fs::read_link(entry.path()) {
+                Ok(target) => Some((number, target)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot read {}: {error}", entry.path().display()),
+            }
         })
-        .unwrap_or_default()
+        .collect();
+    if !table.is_empty() {
+        return Some(table);
+    }
+    // A thread of the process is reaped as soon as it exits; a second is far
+    // longer than that takes even on a loaded runner.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while task.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the descriptor table of the running thread {} reads empty",
+            task.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    None
 }
 
 #[tokio::test]
@@ -1573,13 +1604,13 @@ async fn the_threads_that_open_files_for_the_sandbox_hold_no_descriptor_of_the_e
 
     let serving = serving_threads();
     assert!(!serving.is_empty(), "no broker thread is running");
+    // The home thread lives as long as the sandbox, so its table is always read.
+    let mut home_read = false;
     for (task, comm) in serving {
-        let table = table_of(&task);
-        assert!(
-            !table.is_empty(),
-            "{comm}: the descriptors of {} cannot be read",
-            task.display()
-        );
+        let Some(table) = table_of(&task) else {
+            continue;
+        };
+        home_read |= comm == HOME_THREAD;
         for (number, target) in &table {
             assert!(
                 !target.starts_with(sentinels.directory.path()),
@@ -1603,6 +1634,7 @@ async fn the_threads_that_open_files_for_the_sandbox_hold_no_descriptor_of_the_e
             );
         }
     }
+    assert!(home_read, "the home thread's table was not read");
 }
 
 fn pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
@@ -2219,8 +2251,9 @@ async fn blocked_opens_make_the_broker_start_spare_workers() {
 fn broker_table_size() -> usize {
     serving_threads()
         .iter()
-        .find(|(_, comm)| comm == HOME_THREAD || comm == "heel-broker")
-        .map_or(0, |(task, _)| table_of(task).len())
+        .filter(|(_, comm)| comm == HOME_THREAD || comm == "heel-broker")
+        .find_map(|(task, _)| table_of(task))
+        .map_or(0, |table| table.len())
 }
 
 #[tokio::test]
