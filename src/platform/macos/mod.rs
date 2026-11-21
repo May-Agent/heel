@@ -33,6 +33,10 @@ pub struct MacOSBackend {
     profile: String,
     /// Persistent in-sandbox runner for confined sandboxes (`None` under `host_access`).
     runner: Option<Arc<Runner>>,
+    /// Read/exec initial grants compiled into static SBPL because XNU refused
+    /// `sandbox_extension_issue_file` (`EPERM` on TCC-protected `.app` bundles
+    /// under `launchd`).
+    static_grants: Vec<Grant>,
     /// Keys of Seatbelt extensions currently active inside `runner`.
     active_keys: Mutex<BTreeSet<String>>,
 }
@@ -70,24 +74,62 @@ impl MacOSBackend {
             return Ok(Self {
                 profile,
                 runner: None,
+                static_grants: Vec::new(),
                 active_keys: Mutex::new(BTreeSet::new()),
             });
         }
 
         let staged = StagedRunner::create()?;
-        let profile =
-            profile::generate_profile_with_runner(config, proxy_port, Some(staged.path()))?;
+        let mut static_grants = Vec::new();
+        let mut initial_extensions = Vec::new();
+        let mut initial_keys = BTreeSet::new();
+        if !config.filesystem_strict() {
+            for grant in config.grants() {
+                let key = grant_extension_key(grant);
+                if initial_keys.contains(&key) {
+                    continue;
+                }
+                match issue_macos_extension(grant) {
+                    Ok(token) => {
+                        initial_keys.insert(key.clone());
+                        initial_extensions.push((key, token));
+                    }
+                    Err(Error::Path { source, .. })
+                        if !grant.access().can_write()
+                            && source.raw_os_error() == Some(libc::EPERM) =>
+                    {
+                        static_grants.push(grant.clone());
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        let static_override = (!config.filesystem_strict()).then_some(static_grants.as_slice());
+        let profile = profile::generate_profile_with_runner(
+            config,
+            proxy_port,
+            Some(staged.path()),
+            static_override,
+        )?;
         let setup = PreExecSetup::new(config)?;
         let runner = Runner::start_macos(staged, &profile, setup)?;
-        let backend = Self {
+        if !initial_extensions.is_empty() {
+            runner.sync_extensions(&[], &initial_extensions)?;
+        }
+        Ok(Self {
             profile,
             runner: Some(runner),
-            active_keys: Mutex::new(BTreeSet::new()),
-        };
-        if !config.filesystem_strict() && !config.grants().is_empty() {
-            backend.set_grants(config.grants(), &[])?;
-        }
-        Ok(backend)
+            static_grants,
+            active_keys: Mutex::new(initial_keys),
+        })
+    }
+
+    fn covered_by_static_grants(&self, grant: &Grant) -> bool {
+        self.static_grants.iter().any(|base| {
+            (!grant.access().can_write() || base.access().can_write())
+                && (!grant.access().can_execute() || base.access().can_execute())
+                && grant.path().starts_with(base.path())
+        })
     }
 
     /// Handle to this sandbox's runner.
@@ -106,6 +148,9 @@ impl MacOSBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut to_add = Vec::new();
         for grant in grants {
+            if self.covered_by_static_grants(grant) {
+                continue;
+            }
             let key = grant_extension_key(grant);
             if !active.contains(&key) {
                 to_add.push((key, issue_macos_extension(grant)?));
@@ -132,6 +177,9 @@ impl MacOSBackend {
         let mut desired = BTreeSet::new();
         let mut to_add = Vec::new();
         for grant in grants {
+            if self.covered_by_static_grants(grant) {
+                continue;
+            }
             let key = grant_extension_key(grant);
             if desired.insert(key.clone()) && !active.contains(&key) {
                 to_add.push((key, issue_macos_extension(grant)?));
