@@ -41,6 +41,9 @@ pub(crate) mod preexec;
 #[cfg(unix)]
 pub(crate) mod rlimit;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) mod runner;
+
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -58,9 +61,7 @@ pub(crate) struct SpawnRequest<'a> {
     /// Policy-independent sandbox configuration.
     pub config: &'a SandboxConfigData,
     /// Port of the sandbox proxy, when network access is enabled.
-    ///
-    /// macOS bakes it into the profile generated with the sandbox.
-    #[cfg_attr(target_os = "macos", expect(dead_code))]
+    #[cfg(target_os = "windows")]
     pub proxy_port: Option<u16>,
     /// Program to run.
     pub program: &'a str,
@@ -80,10 +81,9 @@ pub(crate) struct SpawnRequest<'a> {
     pub stdout: StdioConfig,
     /// Standard error configuration.
     pub stderr: StdioConfig,
-    /// A descriptor the process inherits across `exec`, which `std` otherwise
-    /// closes. The caller keeps it open until the spawn returns.
+    /// Descriptors `(host_fd, child_target_fd)` inherited across `exec`.
     #[cfg(target_os = "linux")]
-    pub inherit_fd: Option<std::os::fd::RawFd>,
+    pub inherit_fds: &'a [(std::os::fd::RawFd, i32)],
 }
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]

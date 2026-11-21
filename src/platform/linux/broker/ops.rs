@@ -360,7 +360,7 @@ fn open_read(
     resolve_flags: ResolveFlags,
 ) -> Out {
     let shared = ctx.shared();
-    if !shared.guard.watches_reads() {
+    if !shared.guard().watches_reads() {
         return Ok(Reply::Continue);
     }
     let Ok(bytes) = path_argument(call, path) else {
@@ -378,10 +378,14 @@ fn open_read(
         }
     }
     let target = place.target();
-    if shared.guard.read_denied(&target) {
+    let (denied, is_anc) = {
+        let g = shared.guard();
+        (g.read_denied(&target), g.is_ancestor(&target))
+    };
+    if denied {
         return Err(refuse(ctx, call, Operation::ReadData, &target));
     }
-    if shared.guard.is_ancestor(&target) {
+    if is_anc {
         let fd = rustix::fs::openat(
             &place.parent,
             place.kernel_name(),
@@ -437,19 +441,23 @@ fn open_write(
     } else {
         Operation::WriteData
     };
-    if shared.guard.write_denied(&target) {
+    if shared.guard().write_denied(&target) {
         return Err(refuse(ctx, call, operation, &target));
     }
 
     let exists = match place.stat() {
         Ok(stat) => {
-            if shared.guard.inode_denied(identity(&stat)) {
-                return Err(refuse(ctx, call, operation, &target));
-            }
-            if flags & libc::O_ACCMODE as u32 == libc::O_RDWR as u32
-                && shared.guard.read_denied(&target)
             {
-                return Err(refuse(ctx, call, Operation::ReadData, &target));
+                let g = shared.guard();
+                if g.inode_denied(identity(&stat)) {
+                    return Err(refuse(ctx, call, operation, &target));
+                }
+                if flags & libc::O_ACCMODE as u32 == libc::O_RDWR as u32 && g.read_denied(&target) {
+                    return Err(refuse(ctx, call, Operation::ReadData, &target));
+                }
+                if !g.can_write(&target) {
+                    return Err(EACCES);
+                }
             }
             if is(&stat, FileType::Fifo) && flags & libc::O_NONBLOCK as u32 == 0 {
                 ctx.ensure_spare_worker();
@@ -460,6 +468,9 @@ fn open_write(
             if !creating {
                 return Err(Errno(libc::ENOENT));
             }
+            if !shared.guard().can_modify_dir(&place.parent_path) {
+                return Err(EACCES);
+            }
             false
         }
         Err(error) => return Err(error.into()),
@@ -467,7 +478,7 @@ fn open_write(
 
     if creating
         && !exists
-        && shared.guard.is_ancestor(&place.parent_path)
+        && shared.guard().is_ancestor(&place.parent_path)
         && let Some(fd) = open_pooled(ctx, call, &place, flags, mode)?
     {
         return Ok(installed(fd, flags));
@@ -480,7 +491,7 @@ fn open_write(
         mode_of(mode),
     )?;
     let stat = rustix::fs::fstat(&fd)?;
-    if shared.guard.inode_denied(identity(&stat)) {
+    if shared.guard().inode_denied(identity(&stat)) {
         return Err(refuse(ctx, call, operation, &target));
     }
     if !exists {
@@ -536,13 +547,19 @@ fn open_tmpfile(
     let mut bytes = path_argument(call, path)?;
     bytes.extend_from_slice(b"/.");
     let place = resolve::resolve(call.caller, Base::Dirfd(dirfd), &bytes, resolve_flags)?;
-    if ctx.shared().guard.write_denied(&place.parent_path) {
-        return Err(refuse(
-            ctx,
-            call,
-            Operation::WriteCreate,
-            &place.parent_path,
-        ));
+    {
+        let g = ctx.shared().guard();
+        if g.write_denied(&place.parent_path) {
+            return Err(refuse(
+                ctx,
+                call,
+                Operation::WriteCreate,
+                &place.parent_path,
+            ));
+        }
+        if !g.can_modify_dir(&place.parent_path) {
+            return Err(EACCES);
+        }
     }
     let fd = rustix::fs::openat(
         &place.parent,
@@ -685,8 +702,12 @@ pub(crate) fn casefold_check(
     place: &Place,
     created: &Stat,
 ) -> Result<(), Errno> {
-    let denied = ctx.shared().guard.denied_names(&place.parent_path);
-    for name in denied {
+    let denied: Vec<Vec<u8>> = ctx
+        .shared()
+        .guard()
+        .denied_names(&place.parent_path)
+        .to_vec();
+    for name in &denied {
         if name.as_slice() == place.name.as_slice() {
             continue;
         }
@@ -712,13 +733,18 @@ pub(crate) fn casefold_check(
 fn mkdir(ctx: &Context, call: &Call<'_>, dirfd: i32, path: usize, mode: usize) -> Out {
     let place = place_of(call, dirfd, path, ResolveFlags::empty())?;
     let target = place.target();
-    if ctx.shared().guard.write_denied(&target) {
-        return Err(refuse(ctx, call, Operation::WriteCreate, &target));
-    }
+    let is_anc = {
+        let g = ctx.shared().guard();
+        if g.write_denied(&target) {
+            return Err(refuse(ctx, call, Operation::WriteCreate, &target));
+        }
+        if !g.can_modify_dir(&place.parent_path) {
+            return Err(EACCES);
+        }
+        g.is_ancestor(&place.parent_path)
+    };
     let mode = call.word(mode);
-    if ctx.shared().guard.is_ancestor(&place.parent_path)
-        && let Some((held, stat)) = pooled(ctx, &place, Kind::Directory)?
-    {
+    if is_anc && let Some((held, stat)) = pooled(ctx, &place, Kind::Directory)? {
         settle(ctx, call, &place, &held, mode, true)?;
         casefold_check(ctx, call, &place, &stat)?;
         return Ok(Reply::Value(0));
@@ -740,16 +766,23 @@ fn mknod(
 ) -> Out {
     let place = place_of(call, dirfd, path, ResolveFlags::empty())?;
     let target = place.target();
-    if ctx.shared().guard.write_denied(&target) {
-        return Err(refuse(ctx, call, Operation::WriteCreate, &target));
-    }
+    let is_anc = {
+        let g = ctx.shared().guard();
+        if g.write_denied(&target) {
+            return Err(refuse(ctx, call, Operation::WriteCreate, &target));
+        }
+        if !g.can_modify_dir(&place.parent_path) {
+            return Err(EACCES);
+        }
+        g.is_ancestor(&place.parent_path)
+    };
     let mode = call.word(mode);
     let kind = match mode & libc::S_IFMT {
         0 => FileType::RegularFile,
         _ => FileType::from_raw_mode(mode),
     };
     if kind == FileType::RegularFile
-        && ctx.shared().guard.is_ancestor(&place.parent_path)
+        && is_anc
         && let Some((held, stat)) = pooled(ctx, &place, Kind::File)?
     {
         settle(ctx, call, &place, &held, mode, false)?;
@@ -773,8 +806,14 @@ fn symlink(ctx: &Context, call: &Call<'_>, target: usize, dirfd: i32, path: usiz
     let contents = path_argument(call, target)?;
     let place = place_of(call, dirfd, path, ResolveFlags::empty())?;
     let name = place.target();
-    if ctx.shared().guard.write_denied(&name) {
-        return Err(refuse(ctx, call, Operation::WriteCreate, &name));
+    {
+        let g = ctx.shared().guard();
+        if g.write_denied(&name) {
+            return Err(refuse(ctx, call, Operation::WriteCreate, &name));
+        }
+        if !g.can_modify_dir(&place.parent_path) {
+            return Err(EACCES);
+        }
     }
     rustix::fs::symlinkat(contents.as_slice(), &place.parent, place.kernel_name())?;
     if let Ok(stat) = place.stat() {
@@ -787,8 +826,14 @@ fn link(ctx: &Context, call: &Call<'_>, old: (i32, usize), new: (i32, usize), fl
     let shared = ctx.shared();
     let destination = place_of(call, new.0, new.1, ResolveFlags::empty())?;
     let name = destination.target();
-    if shared.guard.write_denied(&name) {
-        return Err(refuse(ctx, call, Operation::WriteCreate, &name));
+    {
+        let g = shared.guard();
+        if g.write_denied(&name) {
+            return Err(refuse(ctx, call, Operation::WriteCreate, &name));
+        }
+        if !g.can_modify_dir(&destination.parent_path) {
+            return Err(EACCES);
+        }
     }
 
     let old_path = path_argument(call, old.1)?;
@@ -851,33 +896,37 @@ fn link(ctx: &Context, call: &Call<'_>, old: (i32, usize), new: (i32, usize), fl
 /// A hard link makes the same file reachable under a name the policy does not
 /// cover, so a file in a denied tree, or with a name in one, is not linked.
 fn check_source(ctx: &Context, call: &Call<'_>, path: &Path, stat: &Stat) -> Result<(), Errno> {
-    let guard = &ctx.shared().guard;
-    if guard.write_denied(path) || guard.read_denied(path) || guard.inode_denied(identity(stat)) {
+    let denied = {
+        let guard = ctx.shared().guard();
+        guard.write_denied(path) || guard.read_denied(path) || guard.inode_denied(identity(stat))
+    };
+    if denied {
         return Err(refuse(ctx, call, Operation::WriteCreate, path));
     }
     Ok(())
 }
 
 fn rename(ctx: &Context, call: &Call<'_>, old: (i32, usize), new: (i32, usize), flags: u32) -> Out {
-    // `serve` holds the write side for a rename and the read side for every
-    // other call across its check and its act, so a checked name is still the
-    // name when it is acted on.
     let shared = ctx.shared();
     let source = place_of(call, old.0, old.1, ResolveFlags::empty())?;
     let destination = place_of(call, new.0, new.1, ResolveFlags::empty())?;
     let (from, to) = (source.target(), destination.target());
-    if shared.guard.removal_denied(&from) {
-        return Err(refuse(ctx, call, Operation::WriteUnlink, &from));
-    }
-    if shared.guard.removal_denied(&to) {
-        return Err(refuse(ctx, call, Operation::WriteCreate, &to));
-    }
-    // A file moved into a directory above a denied path keeps no grant there,
-    // so it would become unreadable; refusing with `EXDEV` makes the caller copy
-    // it instead, which creates a pooled entry.
-    if shared.guard.is_ancestor(&destination.parent_path)
-        && source.parent_path != destination.parent_path
-        && !shared.guard.is_ancestor(&source.parent_path)
+    let cross_into_anc = {
+        let g = shared.guard();
+        if g.removal_denied(&from) {
+            return Err(refuse(ctx, call, Operation::WriteUnlink, &from));
+        }
+        if g.removal_denied(&to) {
+            return Err(refuse(ctx, call, Operation::WriteCreate, &to));
+        }
+        if !g.can_modify_dir(&source.parent_path) || !g.can_modify_dir(&destination.parent_path) {
+            return Err(EACCES);
+        }
+        g.is_ancestor(&destination.parent_path)
+            && source.parent_path != destination.parent_path
+            && !g.is_ancestor(&source.parent_path)
+    };
+    if cross_into_anc
         && let Ok(stat) = source.stat()
         && (is(&stat, FileType::RegularFile) || is(&stat, FileType::Directory))
     {
@@ -899,8 +948,14 @@ fn rename(ctx: &Context, call: &Call<'_>, old: (i32, usize), new: (i32, usize), 
 fn unlink(ctx: &Context, call: &Call<'_>, dirfd: i32, path: usize, flags: u32) -> Out {
     let place = place_of(call, dirfd, path, ResolveFlags::empty())?;
     let target = place.target();
-    if ctx.shared().guard.removal_denied(&target) {
-        return Err(refuse(ctx, call, Operation::WriteUnlink, &target));
+    {
+        let g = ctx.shared().guard();
+        if g.removal_denied(&target) {
+            return Err(refuse(ctx, call, Operation::WriteUnlink, &target));
+        }
+        if !g.can_modify_dir(&place.parent_path) {
+            return Err(EACCES);
+        }
     }
     let at = if flags & AT_REMOVEDIR != 0 {
         AtFlags::REMOVEDIR
@@ -916,13 +971,16 @@ fn truncate(ctx: &Context, call: &Call<'_>) -> Out {
     let place = place_of(call, AT_FDCWD, 0, ResolveFlags::empty())?;
     let place = resolve::follow(call.caller, place, ResolveFlags::empty())?;
     let target = place.target();
-    if shared.guard.write_denied(&target) {
+    if shared.guard().write_denied(&target) {
         return Err(refuse(ctx, call, Operation::WriteData, &target));
     }
     if let Ok(stat) = place.stat()
-        && shared.guard.inode_denied(identity(&stat))
+        && shared.guard().inode_denied(identity(&stat))
     {
         return Err(refuse(ctx, call, Operation::WriteData, &target));
+    }
+    if !shared.guard().can_write(&target) {
+        return Err(EACCES);
     }
     let length = u64::try_from(call.args[1] as i64).map_err(|_| Errno(libc::EINVAL))?;
     let fd = rustix::fs::openat(
@@ -1042,9 +1100,14 @@ fn hold_subject(
     };
     let (path, stat) = resolve::identify(&fd)?;
     call.caller.still_valid()?;
-    let guard = &ctx.shared().guard;
-    if guard.write_denied(&path) || guard.inode_denied(identity(&stat)) {
-        return Err(refuse(ctx, call, operation, &path));
+    {
+        let guard = ctx.shared().guard();
+        if guard.write_denied(&path) || guard.inode_denied(identity(&stat)) {
+            return Err(refuse(ctx, call, operation, &path));
+        }
+        if !guard.can_write(&path) {
+            return Err(EACCES);
+        }
     }
     Ok(Held { fd, stat, place })
 }

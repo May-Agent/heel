@@ -112,7 +112,7 @@ pub(crate) fn connect(ctx: &Context, call: &Call<'_>) -> Out {
                 ));
             }
         }
-        Address::Abstract if shared.guard.abstract_sockets_denied() => {
+        Address::Abstract if shared.guard().abstract_sockets_denied() => {
             return Err(refuse_network(
                 ctx,
                 call,
@@ -155,7 +155,7 @@ pub(crate) fn bind(ctx: &Context, call: &Call<'_>) -> Out {
                 ));
             }
         }
-        Address::Abstract if shared.guard.abstract_sockets_denied() => {
+        Address::Abstract if shared.guard().abstract_sockets_denied() => {
             return Err(refuse_network(
                 ctx,
                 call,
@@ -234,13 +234,17 @@ fn unix(ctx: &Context, call: &Call<'_>, path: &[u8], which: Syscall) -> Out {
     match which {
         Syscall::Connect => {
             let id = place.stat().ok().map(|stat| (stat.st_dev, stat.st_ino));
-            if shared.guard.socket_denied(&target, id) {
+            if shared.guard().socket_denied(&target, id) {
                 return Err(refuse(ctx, call, Operation::NetworkOutbound, &target));
             }
         }
         Syscall::Bind => {
-            if shared.guard.write_denied(&target) {
+            let g = shared.guard();
+            if g.write_denied(&target) {
                 return Err(refuse(ctx, call, Operation::WriteCreate, &target));
+            }
+            if !g.can_modify_dir(&place.parent_path) {
+                return Err(Errno(libc::EACCES));
             }
         }
     }

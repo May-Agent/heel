@@ -56,12 +56,8 @@ use std::collections::HashSet;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
-
-use landlock::Access as _;
-use libc::sock_filter;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
@@ -78,69 +74,21 @@ use sink::DenialSink;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use filter::x32_refusal;
 
-/// A process to start through the launcher.
-struct Job {
-    command: Command,
+/// A seccomp listener socket handed to the launcher thread.
+struct AcceptJob {
     listener_socket: OwnedFd,
-    reply: SyncSender<io::Result<Child>>,
+    reply: SyncSender<io::Result<()>>,
 }
 
 /// The broker of one sandbox.
 pub(crate) struct Broker {
-    program: Vec<sock_filter>,
+    program_bytes: Vec<u8>,
     /// Dropping the broker drops this, which ends the launcher, which closes its
-    /// end of the home thread's socket and so ends the home thread. The workers
-    /// go on until their listeners are orphaned, which serves a descendant that
-    /// outlives the sandbox.
-    jobs: Sender<Job>,
-}
-
-/// What the child runs between `fork` and `exec` to hand its listener over.
-pub(crate) struct ChildHook {
-    program: Vec<sock_filter>,
-    socket: OwnedFd,
-}
-
-impl ChildHook {
-    /// Install the notification filter and send its listener to the broker.
-    /// Called from `pre_exec`, after the sandbox's Landlock layer.
-    pub(crate) fn install(&self) -> io::Result<()> {
-        // SAFETY: both `prctl` calls take integers by value.
-        unsafe {
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                || libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        let program = libc::sock_fprog {
-            len: u16::try_from(self.program.len())
-                .map_err(|_| io::Error::other("filter too long"))?,
-            filter: self.program.as_ptr().cast_mut(),
-        };
-        let flags =
-            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER | libc::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
-        // SAFETY: `program` points at `len` instructions that outlive the call.
-        let listener = unsafe {
-            libc::syscall(
-                libc::SYS_seccomp,
-                libc::SECCOMP_SET_MODE_FILTER,
-                flags,
-                &raw const program,
-            )
-        };
-        if listener < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let listener = listener as RawFd;
-        // SAFETY: `listener` was returned by the call above and stays open until
-        // it is closed below, after the send.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(listener) };
-        let sent = table::send_fds(self.socket.as_fd(), &[borrowed]);
-        // SAFETY: `listener` was returned by the call above and is not used again.
-        unsafe { libc::close(listener) };
-        sent
-    }
+    /// end of the home thread's socket and so ends the home thread.
+    jobs: Sender<AcceptJob>,
+    /// Shared only for pure-memory policy updates (`Guard` holds no `OwnedFd`).
+    guard: Arc<RwLock<Guard>>,
+    carve_denied: Option<Vec<PathBuf>>,
 }
 
 /// `/proc/sys/kernel/yama/ptrace_scope`, when Yama is loaded.
@@ -227,7 +175,7 @@ fn prepare(
             .map(|ancestor| ancestor.path.clone())
             .collect();
         let pool_dirs = pool.as_ref().map_or_else(Vec::new, PoolPlan::directories);
-        let guard = Guard::new(config, ancestors, pool_dirs)?;
+        let guard = Guard::new(config, plan, ancestors, pool_dirs)?;
         Ok(Prepared {
             carved,
             guard,
@@ -297,7 +245,7 @@ impl Broker {
         check_ptrace_scope()?;
 
         let abi = REQUIRED_ABI;
-        let (sandbox_ruleset, guard, pool, held, broker_rules, coverage) = if denylists {
+        let (sandbox_ruleset, guard, pool, held, carve_denied, coverage) = if denylists {
             let plan = landlock_rules::plan(config);
             let (prepared, held) = prepare_on_a_thread(config, &plan, abi)?;
             let Prepared {
@@ -318,33 +266,29 @@ impl Broker {
                     }
                 })?;
             }
-            let pool_dirs = pool.as_ref().map_or_else(Vec::new, PoolPlan::directories);
-            let mut broker_rules = plan;
-            for directory in pool_dirs {
-                broker_rules.push(Planned {
-                    path: directory,
-                    access: landlock::AccessFs::from_all(abi),
-                    required: true,
-                });
-            }
+            let denied = match config.read_denylist() {
+                Some(read) => {
+                    let resolved = read.resolve()?;
+                    resolved
+                        .trees
+                        .into_iter()
+                        .filter(|tree| !resolved.sockets.contains(tree))
+                        .collect()
+                }
+                None => Vec::new(),
+            };
             let coverage = Coverage {
                 files: true,
                 reads: guard.watches_reads(),
             };
-            (
-                sandbox_ruleset,
-                guard,
-                pool,
-                held,
-                Some(broker_rules),
-                coverage,
-            )
+            (sandbox_ruleset, guard, pool, held, Some(denied), coverage)
         } else {
             // Nothing here lists a user's directory: the guard reads only the
             // mount table, and there is no pool.
-            let guard = Guard::new(config, HashSet::new(), Vec::new())?;
+            let plan = landlock_rules::plan(config);
+            let guard = Guard::new(config, &plan, HashSet::new(), Vec::new())?;
             (
-                landlock_rules::build_ruleset(config, proxy_port)?,
+                landlock_rules::instantiate(&plan, proxy_port, abi)?,
                 guard,
                 None,
                 Vec::new(),
@@ -357,19 +301,23 @@ impl Broker {
         };
 
         let program = filter::build(coverage)?;
-        let broker_ruleset = broker_rules
-            .map(|rules| landlock_rules::instantiate(&rules, proxy_port, abi))
-            .transpose()?;
+        let mut program_bytes = Vec::with_capacity(std::mem::size_of_val(program.as_slice()));
+        for insn in &program {
+            program_bytes.extend_from_slice(&insn.code.to_ne_bytes());
+            program_bytes.push(insn.jt);
+            program_bytes.push(insn.jf);
+            program_bytes.extend_from_slice(&insn.k.to_ne_bytes());
+        }
 
         let diagnostics =
             diag::start().map_err(init("cannot start the broker's diagnostics thread"))?;
+        let guard = Arc::new(RwLock::new(guard));
         let (jobs, queue) = channel();
         let (ready, started) = sync_channel(1);
         let launch = Launch {
-            ruleset: broker_ruleset,
             held,
             setup: home::Setup {
-                guard,
+                guard: Arc::clone(&guard),
                 pool,
                 sink,
                 proxy_port,
@@ -387,12 +335,25 @@ impl Broker {
             .map_err(|error| Error::InitFailed(error.to_string()))?;
 
         tracing::info!(full = denylists, "broker started");
-        Ok(Some((Self { program, jobs }, sandbox_ruleset)))
+        Ok(Some((
+            Self {
+                program_bytes,
+                jobs,
+                guard,
+                carve_denied,
+            },
+            sandbox_ruleset,
+        )))
     }
 
-    /// What a command needs to be served by this broker: the hook for its child
-    /// and the end of the channel the broker receives the listener on.
-    pub(crate) fn prepare(&self) -> io::Result<(ChildHook, OwnedFd)> {
+    /// Raw `sock_filter` bytes of the seccomp notification filter.
+    pub(crate) fn program_bytes(&self) -> &[u8] {
+        &self.program_bytes
+    }
+
+    /// Create the `(parent_socket, child_socket)` pair used to hand a listener
+    /// descriptor from `pre_exec` to the broker.
+    pub(crate) fn prepare_sockets(&self) -> io::Result<(OwnedFd, OwnedFd)> {
         let mut fds = [0 as RawFd; 2];
         // SAFETY: `socketpair` fills two descriptors.
         let result = unsafe {
@@ -407,23 +368,14 @@ impl Broker {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: both descriptors are new and owned by nothing else.
-        let (parent, child) =
-            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        Ok((
-            ChildHook {
-                program: self.program.clone(),
-                socket: child,
-            },
-            parent,
-        ))
+        Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
     }
 
-    /// Start `command` from the launcher thread and begin serving it.
-    pub(crate) fn spawn(&self, command: Command, listener_socket: OwnedFd) -> io::Result<Child> {
+    /// Receive a seccomp listener from `listener_socket` and start serving it.
+    pub(crate) fn accept_listener(&self, listener_socket: OwnedFd) -> io::Result<()> {
         let (reply, result) = sync_channel(1);
         self.jobs
-            .send(Job {
-                command,
+            .send(AcceptJob {
                 listener_socket,
                 reply,
             })
@@ -432,11 +384,35 @@ impl Broker {
             .recv()
             .map_err(|_| io::Error::other("the broker's launcher exited"))?
     }
+
+    /// Extend `ruleset` and the broker's positive write allowlist with live grants.
+    pub(crate) fn extend_ruleset(
+        &self,
+        ruleset: &mut PreparedRuleset,
+        config: &SandboxConfigData,
+        new_writable: &[&std::path::Path],
+    ) -> Result<()> {
+        if !new_writable.is_empty() {
+            let mut g = self.guard.write().unwrap_or_else(PoisonError::into_inner);
+            for path in new_writable {
+                g.add_writable_path(path);
+            }
+        }
+        let abi = REQUIRED_ABI;
+        let plan = landlock_rules::plan(config);
+        match &self.carve_denied {
+            Some(denied) => {
+                let carved = landlock_rules::carve(plan, denied, abi)?;
+                let sandbox_rules = without_writes(&carved.rules, abi);
+                ruleset.add_planned(&sandbox_rules, abi)
+            }
+            None => ruleset.add_planned(&plan, abi),
+        }
+    }
 }
 
 /// What the launcher thread is started with.
 struct Launch {
-    ruleset: Option<PreparedRuleset>,
     /// The inode pool's directories, to send to the home thread.
     held: Vec<OwnedFd>,
     setup: home::Setup,
@@ -448,22 +424,12 @@ struct HomeLink {
     acknowledgements: Receiver<io::Result<()>>,
 }
 
-/// Restrict this thread, start the home thread, and wait until it is ready.
+/// Start the home thread and wait until it is ready.
 fn start_home(launch: Launch) -> io::Result<HomeLink> {
-    let Launch {
-        ruleset,
-        held,
-        setup,
-    } = launch;
-    if let Some(ruleset) = ruleset {
-        ruleset
-            .restrict_self()
-            .map_err(|error| io::Error::other(format!("cannot restrict the broker: {error}")))?;
-    }
+    let Launch { held, setup } = launch;
     let (ours, theirs) = table::socket_pair()?;
     let (acknowledge, acknowledgements) = channel();
     let has_pool = setup.pool.is_some();
-    // Started after the restriction, so it is in the same Landlock domain.
     table::spawn("heel-broker-home", theirs, move |socket| {
         home::run(&socket, setup, &acknowledge);
     })
@@ -481,36 +447,23 @@ fn start_home(launch: Launch) -> io::Result<HomeLink> {
     })
 }
 
-/// Start `job`'s process, hand its listener to the home thread, and wait until
-/// the workers are listening.
-fn start_job(home: &HomeLink, job: &mut Job) -> io::Result<Child> {
-    let mut child = job.command.spawn()?;
-    let handed_over = (|| {
-        let listener = table::recv_fds(job.listener_socket.as_fd())?.ok_or_else(|| {
-            io::Error::other("the sandboxed process ended before it handed over its listener")
-        })?;
-        let borrowed: Vec<BorrowedFd<'_>> = listener.iter().map(AsFd::as_fd).collect();
-        table::send_fds(home.socket.as_fd(), &borrowed)?;
-        // The launcher's own copy goes: the home thread's is the one that counts.
-        drop(listener);
-        home.acknowledgements
-            .recv()
-            .map_err(|_| io::Error::other("the broker's home thread ended"))?
-    })();
-    match handed_over {
-        Ok(()) => Ok(child),
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(error)
-        }
-    }
+fn hand_over_listener(home: &HomeLink, listener_socket: &OwnedFd) -> io::Result<()> {
+    let listener = table::recv_fds(listener_socket.as_fd())?.ok_or_else(|| {
+        io::Error::other("the sandboxed process ended before it handed over its listener")
+    })?;
+    let borrowed: Vec<BorrowedFd<'_>> = listener.iter().map(AsFd::as_fd).collect();
+    table::send_fds(home.socket.as_fd(), &borrowed)?;
+    drop(listener);
+    home.acknowledgements
+        .recv()
+        .map_err(|_| io::Error::other("the broker's home thread ended"))?
 }
 
-/// The launcher thread: restricted once, then forking every sandboxed process.
+/// The launcher thread: accepts seccomp listeners from sandboxed processes and
+/// hands them to the home thread.
 ///
 /// Ends when the broker is dropped and the queue of jobs is empty.
-fn launcher(launch: Launch, queue: &Receiver<Job>, ready: &SyncSender<io::Result<()>>) {
+fn launcher(launch: Launch, queue: &Receiver<AcceptJob>, ready: &SyncSender<io::Result<()>>) {
     let home = match start_home(launch) {
         Ok(home) => home,
         Err(error) => {
@@ -519,8 +472,8 @@ fn launcher(launch: Launch, queue: &Receiver<Job>, ready: &SyncSender<io::Result
         }
     };
     let _ = ready.send(Ok(()));
-    for mut job in queue {
-        let outcome = start_job(&home, &mut job);
+    for job in queue {
+        let outcome = hand_over_listener(&home, &job.listener_socket);
         let _ = job.reply.send(outcome);
     }
 }

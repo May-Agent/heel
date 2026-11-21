@@ -89,6 +89,8 @@ pub(crate) enum Request {
 /// Supervisor to host.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Event {
+    /// The command started inside the supervisor with `pid` (in its PID namespace).
+    Started { pid: u32 },
     /// The command exited and the tree was torn down (foreground mode).
     Leftover(TreeReport),
     /// A [`Request::Kill`] was carried out.

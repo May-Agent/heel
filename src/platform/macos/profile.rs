@@ -318,6 +318,7 @@ impl HostRules {
 #[template(path = "sandbox.txt", escape = "none")]
 struct SandboxProfile {
     grants: Vec<GrantRules>,
+    runner_executable: Option<String>,
     working_dir: String,
     executable_working_dir: bool,
     ipc_bin_dir: Option<String>,
@@ -371,6 +372,15 @@ struct HostProfile {
 /// host-access configuration instead renders the profile that confines
 /// nothing and keeps only the attribution pair.
 pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<String> {
+    generate_profile_with_runner(config, proxy_port, None)
+}
+
+/// Generate an SBPL profile that also permits executing a staged persistent runner.
+pub(crate) fn generate_profile_with_runner(
+    config: &SandboxConfigData,
+    proxy_port: Option<u16>,
+    runner_executable: Option<&Path>,
+) -> Result<String> {
     let attribution = config.attribution().ok_or_else(|| {
         Error::InitFailed(
             "a sandbox profile needs the attribution files its sandbox creates".to_string(),
@@ -449,6 +459,7 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
 
     let template = SandboxProfile {
         grants,
+        runner_executable: runner_executable.map(sbpl_path).transpose()?,
         working_dir: sbpl_path(config.working_dir())?,
         executable_working_dir: config.working_dir_is_executable(),
         ipc_bin_dir: config.ipc_bin_dir().map(sbpl_path).transpose()?,

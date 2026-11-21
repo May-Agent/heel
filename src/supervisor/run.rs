@@ -159,6 +159,7 @@ pub fn run(config: Config) -> io::Result<i32> {
             return Err(error);
         }
     };
+    send(&control, &Event::Started { pid: command.id() })?;
 
     let mut supervisor = Supervisor {
         mode,

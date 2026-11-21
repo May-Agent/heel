@@ -104,7 +104,7 @@
 
 ; --- Process operations ---
 (allow process-fork)
-(allow signal)
+(allow signal (target same-sandbox))
 (allow ipc-posix*)
 (allow file-lock)
 (allow process-info-setcontrol)
@@ -243,6 +243,22 @@
 (deny process-exec ({{ grant.filter }} "{{ grant.path }}"))
 {% endif %}
 {% endfor %}
+
+; Dynamic grants consumed at runtime through `sandbox_extension_consume`, placed
+; before the working directory and Pass 4 host protections so host protections
+; still override them.
+(allow file-read* (extension "heel.grant.read"))
+(allow file-read* file-write* file-write-create file-write-unlink (extension "heel.grant.write"))
+(deny process-exec (extension "heel.grant.write"))
+(allow file-read* file-map-executable process-exec (extension "heel.grant.exec"))
+(allow file-read* file-write* file-write-create file-write-unlink file-map-executable process-exec (extension "heel.grant.write-exec"))
+
+{% if let Some(runner) = runner_executable %}
+; Persistent sandbox runner binary staged by the host for this sandbox alone.
+(allow file-read* (literal "{{ runner }}"))
+(allow file-map-executable (literal "{{ runner }}"))
+(allow process-exec (literal "{{ runner }}"))
+{% endif %}
 
 ; Working directory: full read and write. It comes after the grants above on
 ; purpose: exec is settled here, not by a grant covering one of its parents —

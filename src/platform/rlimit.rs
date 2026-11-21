@@ -58,6 +58,15 @@ impl PreparedLimits {
         self.limits.is_empty()
     }
 
+    /// Raw `(resource, limit)` pairs for the persistent runner.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn raw_pairs(&self) -> Vec<(i32, u64)> {
+        self.limits
+            .iter()
+            .map(|limit| (limit.resource, limit.value))
+            .collect()
+    }
+
     /// Install the limits on the current process.
     ///
     /// Safe to call from `pre_exec`: it only issues `setrlimit` syscalls.

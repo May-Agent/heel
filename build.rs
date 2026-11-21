@@ -30,14 +30,26 @@ const FETCH_TIME_LIMIT_SECONDS: &str = "120";
 /// Name of the file written to `OUT_DIR`.
 const OUTPUT_NAME: &str = "heel-shim";
 
+/// Name of the persistent in-sandbox Unix runner written to `OUT_DIR`.
+const RUNNER_OUTPUT_NAME: &str = "heel-unix-runner";
+
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=DOCS_RS");
+
+    let out_dir = PathBuf::from(required_env("OUT_DIR"));
+    let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
+    let target = required_env("TARGET");
+    let target_os = required_env("CARGO_CFG_TARGET_OS");
+
+    if matches!(target_os.as_str(), "macos" | "linux") {
+        build_unix_runner(&manifest_dir, &out_dir, &target);
+    }
+
     if std::env::var_os("CARGO_FEATURE_SHIM").is_none() {
         return;
     }
 
-    let out_dir = PathBuf::from(required_env("OUT_DIR"));
     let output = out_dir.join(OUTPUT_NAME);
     if std::env::var_os("DOCS_RS").is_some() {
         // Nothing runs on docs.rs and its sandbox has no network.
@@ -45,9 +57,7 @@ fn main() {
         return;
     }
 
-    let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
-    let target = required_env("TARGET");
-    let windows = required_env("CARGO_CFG_TARGET_OS") == "windows";
+    let windows = target_os == "windows";
     let executable = if windows {
         format!("{OUTPUT_NAME}.exe")
     } else {
@@ -62,6 +72,33 @@ fn main() {
     };
     std::fs::copy(&built, &output)
         .unwrap_or_else(|error| panic!("copying {} failed: {error}", built.display()));
+}
+
+/// Compile the standalone zero-dependency Unix sandbox runner with `RUSTC`.
+fn build_unix_runner(manifest_dir: &Path, out_dir: &Path, target: &str) {
+    let source = manifest_dir.join("src/platform/runner_bin.rs");
+    println!("cargo::rerun-if-changed={}", source.display());
+    let output = out_dir.join(RUNNER_OUTPUT_NAME);
+    if std::env::var_os("DOCS_RS").is_some() {
+        std::fs::write(&output, []).expect("writes the placeholder unix runner");
+        return;
+    }
+    let mut rustc = Command::new(required_env("RUSTC"));
+    rustc
+        .args([
+            "--edition=2024",
+            "-O",
+            "-D",
+            "warnings",
+            "--crate-name",
+            "heel_unix_runner",
+        ])
+        .arg("--target")
+        .arg(target)
+        .arg(&source)
+        .arg("-o")
+        .arg(&output);
+    run(rustc).unwrap_or_else(|error| panic!("building the unix sandbox runner failed: {error}"));
 }
 
 /// Build the shim from the source beside this package.

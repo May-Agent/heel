@@ -13,8 +13,7 @@ use std::path::{Path, PathBuf};
 // needed in scope; the name itself belongs to this crate's own `Access`.
 use landlock::{
     ABI, Access as _, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
-    PathFd, RestrictSelfError, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
-    RulesetError, RulesetStatus, make_bitflags,
+    PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, make_bitflags,
 };
 
 use crate::config::SandboxConfigData;
@@ -41,6 +40,41 @@ impl std::fmt::Debug for PreparedRuleset {
 }
 
 impl PreparedRuleset {
+    /// Duplicate the underlying Landlock ruleset file descriptor for transfer
+    /// over `SCM_RIGHTS` to the persistent container runner.
+    pub(crate) fn duplicate_fd(&self) -> std::io::Result<OwnedFd> {
+        let cloned = self.inner.try_clone()?;
+        Option::<OwnedFd>::from(cloned)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    /// Append additional planned rules to this live ruleset.
+    pub(crate) fn add_planned(&mut self, rules: &[Planned], abi: ABI) -> Result<()> {
+        for rule in rules {
+            if rule.required {
+                add_required_path(&mut self.inner, &rule.path, rule.access, abi)?;
+            } else {
+                add_system_path(&mut self.inner, &rule.path, rule.access, abi)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a rule for the container's private `/proc` mount root inode.
+    pub(crate) fn grant_private_proc(
+        &mut self,
+        proc_fd: BorrowedFd<'_>,
+        writable: bool,
+    ) -> Result<()> {
+        let abi = REQUIRED_ABI;
+        let access = if writable {
+            AccessFs::from_read(abi) | writable_access(abi)
+        } else {
+            AccessFs::from_read(abi)
+        };
+        self.add_inode(proc_fd, access, abi)
+    }
+
     /// Add a rule for an inode held by `fd`, narrowed to what the inode can take.
     ///
     /// The ruleset keeps its own reference to the inode, so `fd` can be closed
@@ -53,41 +87,6 @@ impl PreparedRuleset {
     ) -> Result<()> {
         let access = effective_path_access(&fd, "an inode held open", access, abi)?;
         add_rule_fd(&mut self.inner, fd, access)
-    }
-
-    /// A handle on the same ruleset, for one process to enforce.
-    ///
-    /// The kernel lets any number of processes enforce one ruleset, so a sandbox
-    /// builds its ruleset once and every command it starts gets a duplicate of
-    /// the descriptor. Duplicating is a syscall and so is done on the host, never
-    /// after the fork.
-    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
-        Ok(Self {
-            inner: self.inner.try_clone()?,
-        })
-    }
-
-    /// Apply the ruleset to the current process. Called from `pre_exec`.
-    ///
-    /// Anything short of full enforcement is an error: a partially applied
-    /// sandbox looks like a sandbox but does not act like one.
-    pub(crate) fn restrict_self(self) -> std::io::Result<()> {
-        let status = self.inner.restrict_self().map_err(landlock_error_to_io)?;
-
-        match status.ruleset {
-            RulesetStatus::FullyEnforced => Ok(()),
-            RulesetStatus::PartiallyEnforced | RulesetStatus::NotEnforced => {
-                Err(std::io::Error::from_raw_os_error(libc::EPERM))
-            }
-        }
-    }
-}
-
-fn landlock_error_to_io(error: RulesetError) -> std::io::Error {
-    match error {
-        RulesetError::RestrictSelf(RestrictSelfError::SetNoNewPrivsCall { source, .. })
-        | RulesetError::RestrictSelf(RestrictSelfError::RestrictSelfCall { source, .. }) => source,
-        other => std::io::Error::other(format!("Landlock restrict_self failed: {other}")),
     }
 }
 

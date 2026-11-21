@@ -47,11 +47,20 @@ pub(crate) struct Guard {
     pool_dirs: Vec<PathBuf>,
     /// For each directory, the names directly inside it that are denied.
     denied_children: HashMap<PathBuf, Vec<Vec<u8>>>,
+    /// Positive write allowlist (from `landlock_rules::plan`), enforced by the
+    /// broker because the broker thread itself stays in the root Landlock
+    /// domain so `domain_scope_le` permits `process_vm_readv` and `pidfd_getfd`
+    /// into container children across live grant updates.
+    writable_file_system: bool,
+    writable_dirs: Vec<PathBuf>,
+    writable_files: Vec<PathBuf>,
+    mounts: Vec<Mount>,
     reads_denied: bool,
     writes_denied: bool,
 }
 
 /// One mount of `/proc/self/mountinfo`.
+#[derive(Debug)]
 struct Mount {
     device: String,
     root: PathBuf,
@@ -147,16 +156,37 @@ impl Guard {
     /// the directories the inode pool lives in.
     pub(crate) fn new(
         config: &SandboxConfigData,
+        plan: &[crate::platform::linux::landlock_rules::Planned],
         ancestors: HashSet<PathBuf>,
         pool_dirs: Vec<PathBuf>,
     ) -> Result<Self> {
         let mounts = read_mounts().map_err(|error| {
             crate::error::Error::InitFailed(format!("cannot read /proc/self/mountinfo: {error}"))
         })?;
+        let abi = crate::platform::linux::landlock_rules::REQUIRED_ABI;
+        let read_only = crate::platform::linux::landlock_rules::read_rights(abi);
+        let mut raw_dirs = pool_dirs.clone();
+        let mut raw_files = Vec::new();
+        for rule in plan {
+            if !(rule.access & !read_only).is_empty() {
+                if std::fs::symlink_metadata(&rule.path).is_ok_and(|m| m.is_dir()) {
+                    raw_dirs.push(rule.path.clone());
+                } else {
+                    raw_files.push(rule.path.clone());
+                }
+            }
+        }
+        let writable_dirs = expand(&raw_dirs, &mounts);
+        let writable_files = expand(&raw_files, &mounts);
+
         let mut guard = Self {
             ancestors,
             pool_dirs,
             ipc_socket: config.ipc_socket().map(Path::to_path_buf),
+            writable_file_system: config.writable_file_system(),
+            writable_dirs,
+            writable_files,
+            mounts: Vec::new(),
             ..Self::default()
         };
 
@@ -196,7 +226,37 @@ impl Guard {
                 }
             }
         }
+        guard.mounts = mounts;
         Ok(guard)
+    }
+
+    /// Record an additional writable path granted dynamically at runtime.
+    pub(crate) fn add_writable_path(&mut self, path: &Path) {
+        let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+        let dest = if is_dir {
+            &mut self.writable_dirs
+        } else {
+            &mut self.writable_files
+        };
+        for alias in with_aliases(path, &self.mounts) {
+            if !dest.contains(&alias) {
+                dest.push(alias);
+            }
+        }
+    }
+
+    /// Whether `path` may have its contents or metadata written under the
+    /// positive sandbox policy.
+    pub(crate) fn can_write(&self, path: &Path) -> bool {
+        self.writable_file_system
+            || self.writable_dirs.iter().any(|dir| path.starts_with(dir))
+            || self.writable_files.iter().any(|file| file == path)
+    }
+
+    /// Whether entries may be created, unlinked or renamed inside `dir` under
+    /// the positive sandbox policy.
+    pub(crate) fn can_modify_dir(&self, dir: &Path) -> bool {
+        self.writable_file_system || self.writable_dirs.iter().any(|root| dir.starts_with(root))
     }
 
     /// Whether any denial is configured, so that opens that only read matter.
@@ -334,7 +394,8 @@ mod tests {
             .write_denylist(WriteDenylist::persistence().home(home))
             .build()
             .into_parts();
-        Guard::new(&data, HashSet::new(), Vec::new()).unwrap()
+        let plan = crate::platform::linux::landlock_rules::plan(&data);
+        Guard::new(&data, &plan, HashSet::new(), Vec::new()).unwrap()
     }
 
     #[test]
@@ -415,7 +476,8 @@ mod tests {
             .write_denylist(WriteDenylist::persistence().home(&root).except(&clones))
             .build()
             .into_parts();
-        let guard = Guard::new(&data, HashSet::new(), Vec::new()).unwrap();
+        let plan = crate::platform::linux::landlock_rules::plan(&data);
+        let guard = Guard::new(&data, &plan, HashSet::new(), Vec::new()).unwrap();
         assert!(!guard.write_denied(&clones.join("checkout/.git/hooks/sample")));
         assert!(!guard.removal_denied(&clones.join("checkout/.git")));
         assert!(guard.write_denied(&root.join("work/.git/hooks/pre-commit")));

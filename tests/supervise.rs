@@ -162,7 +162,10 @@ async fn a_setsid_descendant_that_outlives_its_parent_is_killed_and_reported() {
         exit.report
     );
     assert!(exit.report.survivors.is_empty());
-    assert!(!listed(helper), "the helper is gone, zombie included");
+    assert!(
+        sandbox.resolve_pid(helper).is_none(),
+        "the helper is gone, zombie included"
+    );
 }
 
 #[tokio::test]
@@ -187,7 +190,13 @@ async fn a_background_command_stays_until_its_descendant_exits() {
     let dir = sandbox.working_dir();
     let shell = pid_file(dir, "shell").await;
     let helper = pid_file(dir, "helper").await;
-    eventually("the supervisor to reap the shell", || !listed(shell)).await;
+    let helper_host = sandbox
+        .resolve_pid(helper)
+        .expect("helper is alive in sandbox");
+    eventually("the supervisor to reap the shell", || {
+        sandbox.resolve_pid(shell).is_none()
+    })
+    .await;
     // A supervisor that was going to exit on reaping the shell does so within
     // moments, and would be a zombie of this process by then.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -196,7 +205,10 @@ async fn a_background_command_stays_until_its_descendant_exits() {
         state(supervisor).is_some_and(|state| state != 'Z'),
         "the supervisor outlives the command while a descendant runs"
     );
-    assert!(leads_its_session(helper), "the helper is still running");
+    assert!(
+        leads_its_session(helper_host),
+        "the helper is still running"
+    );
 
     std::fs::write(dir.join("release"), "").unwrap();
     let status = bounded("the background command", child.wait())
@@ -204,7 +216,7 @@ async fn a_background_command_stays_until_its_descendant_exits() {
         .expect("the supervisor reports");
 
     assert!(status.success(), "the command's status is kept: {status:?}");
-    assert!(!listed(helper), "the helper is gone, zombie included");
+    assert!(!listed(helper_host), "the helper is gone, zombie included");
 }
 
 #[tokio::test]
@@ -273,7 +285,10 @@ async fn no_zombie_remains_under_the_host() {
 
     assert!(!listed(supervisor), "the supervisor itself is reaped");
     for killed in &exit.report.killed {
-        assert!(!listed(killed.pid), "{killed:?} left a zombie");
+        assert!(
+            sandbox.resolve_pid(killed.pid).is_none(),
+            "{killed:?} left a zombie"
+        );
     }
     assert!(
         zombie_children().iter().all(|&pid| pid != supervisor),
@@ -292,6 +307,7 @@ async fn killing_a_foreground_command_that_is_still_running_reports_the_tree() {
         .expect("spawns");
 
     let sleeper = pid_file(sandbox.working_dir(), "sleeper").await;
+    let sleeper_host = sandbox.resolve_pid(sleeper).expect("sleeper is alive");
     let report = bounded("the tree kill", child.kill_tree())
         .await
         .expect("the tree dies");
@@ -305,7 +321,7 @@ async fn killing_a_foreground_command_that_is_still_running_reports_the_tree() {
         .expect("the supervisor reports");
     assert!(!exit.status.success());
     assert_eq!(exit.report, report);
-    assert!(!listed(sleeper));
+    assert!(!listed(sleeper_host));
 }
 
 #[tokio::test]
@@ -386,7 +402,8 @@ async fn spawn_with_helper(
         .spawn_supervised(Background { reap_timeout: REAP })
         .await
         .expect("spawns");
-    let helper = pid_file(sandbox.working_dir(), "helper").await;
+    let helper_ns = pid_file(sandbox.working_dir(), "helper").await;
+    let helper = sandbox.resolve_pid(helper_ns).expect("helper is alive");
     eventually("the helper to leave the session", || {
         leads_its_session(helper)
     })

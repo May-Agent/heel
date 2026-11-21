@@ -7,13 +7,14 @@ pub use profile::generate_profile;
 
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};
-
-use blocking::unblock;
+use std::sync::Arc;
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
+use crate::grant::Grant;
 use crate::platform::child::unix::UnixChild;
 use crate::platform::preexec::PreExecSetup;
+use crate::platform::runner::{Runner, SandboxHandle, StagedRunner, issue_macos_extension};
 use crate::platform::{Backend, Child, SpawnRequest};
 
 /// Absolute path to the system sandbox launcher.
@@ -22,17 +23,20 @@ use crate::platform::{Backend, Child, SpawnRequest};
 /// side-stepped by an attacker-controlled search path.
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// macOS sandbox backend using `sandbox-exec`.
+/// macOS sandbox backend using a persistent `sandbox-exec` runner per sandbox.
 pub struct MacOSBackend {
-    /// The SBPL profile every command of the sandbox runs under, generated once
-    /// with the sandbox so a configured path that cannot be granted fails
-    /// creation.
+    /// The SBPL profile every command of the sandbox runs under.
     profile: String,
+    /// Persistent in-sandbox runner for confined sandboxes (`None` under `host_access`).
+    runner: Option<Arc<Runner>>,
+    /// Live Seatbelt extension tokens issued through [`Sandbox::grant`], also
+    /// applied in each child's `pre_exec` so they survive `execve`.
+    live_tokens: std::sync::Mutex<Vec<String>>,
 }
 
 impl MacOSBackend {
-    /// Create the backend, checking that the OS is new enough and generating
-    /// the sandbox profile.
+    /// Create the backend, checking that the OS is new enough, generating the
+    /// sandbox profile, and starting the persistent in-sandbox runner.
     pub fn new(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<Self> {
         let version = Self::macos_version()?;
         if version < (10, 15) {
@@ -43,8 +47,67 @@ impl MacOSBackend {
             });
         }
 
-        let profile = profile::generate_profile(config, proxy_port)?;
-        Ok(Self { profile })
+        if config.host_access() {
+            let profile = profile::generate_profile(config, proxy_port)?;
+            return Ok(Self {
+                profile,
+                runner: None,
+                live_tokens: std::sync::Mutex::new(Vec::new()),
+            });
+        }
+
+        let staged = StagedRunner::create()?;
+        let profile =
+            profile::generate_profile_with_runner(config, proxy_port, Some(staged.path()))?;
+        let setup = PreExecSetup::new(config)?;
+        let runner = Runner::start_macos(staged, &profile, setup)?;
+        Ok(Self {
+            profile,
+            runner: Some(runner),
+            live_tokens: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Handle to this sandbox's runner.
+    pub(crate) fn handle(&self) -> SandboxHandle {
+        SandboxHandle {}
+    }
+
+    /// Dynamically grant `grants` to the persistent in-sandbox runner.
+    pub(crate) fn grant(&self, grants: &[Grant]) -> Result<()> {
+        let Some(runner) = &self.runner else {
+            return Ok(());
+        };
+        let tokens = grants
+            .iter()
+            .map(issue_macos_extension)
+            .collect::<Result<Vec<_>>>()?;
+        runner.consume_extensions(&tokens)?;
+        self.live_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(tokens);
+        Ok(())
+    }
+
+    /// Shut down the persistent runner before sweeping sandbox members.
+    pub(crate) fn shutdown(&self) {
+        if let Some(runner) = &self.runner {
+            runner.shutdown();
+        }
+    }
+
+    /// Translate a sandbox-local PID to its host PID, if currently alive.
+    pub(crate) fn resolve_pid(&self, sandbox_pid: u32) -> Option<u32> {
+        // SAFETY: signal 0 probes process existence without sending a signal.
+        let rc = unsafe { libc::kill(sandbox_pid as libc::pid_t, 0) };
+        (rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+            .then_some(sandbox_pid)
+    }
+
+    /// Return `host_pid` if currently alive (caller checks Seatbelt membership).
+    pub(crate) fn pid_in_sandbox(&self, host_pid: u32) -> Option<u32> {
+        self.resolve_pid(host_pid)
     }
 
     /// Read the host's macOS version.
@@ -66,36 +129,23 @@ impl MacOSBackend {
         parse_macos_version(version.trim())
     }
 
-    /// Turn a spawn request into a configured `sandbox-exec` invocation.
-    fn build_command(&self, request: &SpawnRequest<'_>) -> Result<Command> {
+    /// Turn a host-access spawn request into a direct `sandbox-exec` invocation.
+    fn build_host_command(&self, request: &SpawnRequest<'_>) -> Result<Command> {
         let mut cmd = Command::new(SANDBOX_EXEC);
         cmd.arg("-p").arg(&self.profile);
         cmd.arg(request.program);
         cmd.args(request.args);
         cmd.current_dir(request.working_dir());
 
-        // Start from nothing and add back only what was asked for.
         cmd.env_clear();
-        for var in request.config.env_passthrough() {
-            if let Ok(value) = std::env::var(var) {
-                cmd.env(var, value);
-            }
-        }
-        for (key, value) in request.envs {
+        for (key, value) in merged_envs(request.config, request.envs) {
             cmd.env(key, value);
         }
 
-        // Installing a `pre_exec` hook rules out the `posix_spawn` fast path,
-        // so it is only added when there is actually something to apply.
-        //
-        // The hook runs before `sandbox-exec` is executed, so the limits and
-        // the priority cover the launcher, the sandboxed program and every
-        // descendant either creates.
         let setup = PreExecSetup::new(request.config)?;
         if !setup.is_empty() {
             // SAFETY: the closure only issues `setrlimit`, `setpriority` and
-            // `setiopolicy_np`, which are async-signal-safe and
-            // allocation-free, as `pre_exec` requires.
+            // `setiopolicy_np`, which are async-signal-safe and allocation-free.
             unsafe {
                 cmd.pre_exec(move || setup.apply());
             }
@@ -103,21 +153,64 @@ impl MacOSBackend {
 
         Ok(cmd)
     }
+
+    fn spawn_sync(&self, request: &SpawnRequest<'_>) -> Result<Child> {
+        if let Some(runner) = &self.runner {
+            let envs = merged_envs(request.config, request.envs);
+            // Resource limits and scheduling priority were installed on the
+            // persistent runner before `sandbox-exec` and are inherited across `fork`.
+            let extra_tokens = self
+                .live_tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let child = runner.spawn_command(
+                request.program,
+                request.args,
+                &envs,
+                request.working_dir(),
+                request.stdin,
+                request.stdout,
+                request.stderr,
+                &[],
+                None,
+                None,
+                &extra_tokens,
+            )?;
+            return Ok(Child::new(UnixChild::from_runner(child)));
+        }
+
+        let mut cmd = self.build_host_command(request)?;
+        cmd.stdin(std::process::Stdio::from(request.stdin));
+        cmd.stdout(std::process::Stdio::from(request.stdout));
+        cmd.stderr(std::process::Stdio::from(request.stderr));
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        Ok(Child::new(UnixChild::new(child)))
+    }
+}
+
+fn merged_envs(config: &SandboxConfigData, envs: &[(String, String)]) -> Vec<(String, String)> {
+    let mut merged = Vec::with_capacity(config.env_passthrough().len() + envs.len());
+    for var in config.env_passthrough() {
+        if let Ok(value) = std::env::var(var) {
+            merged.push((var.clone(), value));
+        }
+    }
+    merged.extend_from_slice(envs);
+    merged
 }
 
 impl Backend for MacOSBackend {
     async fn execute(&self, request: SpawnRequest<'_>) -> Result<Output> {
         tracing::debug!(program = %request.program, args = ?request.args, "sandbox: executing");
 
-        let mut cmd = self.build_command(&request)?;
-        cmd.stdin(std::process::Stdio::from(request.stdin));
-        cmd.stdout(std::process::Stdio::from(request.stdout));
-        cmd.stderr(std::process::Stdio::from(request.stderr));
-
-        let output = unblock(move || cmd.output()).await?;
+        let program_name = request.program.to_owned();
+        let child = self.spawn(request).await?;
+        let output = child.wait_with_output().await?;
 
         tracing::debug!(
-            program = %request.program,
+            program = %program_name,
             exit_code = ?output.status.code(),
             success = output.status.success(),
             "sandbox: command completed"
@@ -129,17 +222,10 @@ impl Backend for MacOSBackend {
     async fn spawn(&self, request: SpawnRequest<'_>) -> Result<Child> {
         tracing::debug!(program = %request.program, args = ?request.args, "sandbox: spawning");
 
-        let mut cmd = self.build_command(&request)?;
-        cmd.stdin(std::process::Stdio::from(request.stdin));
-        cmd.stdout(std::process::Stdio::from(request.stdout));
-        cmd.stderr(std::process::Stdio::from(request.stderr));
-        // Its own process group, so the whole tree can be killed at once.
-        cmd.process_group(0);
-
-        let child = cmd.spawn()?;
+        let child = self.spawn_sync(&request)?;
         tracing::debug!(program = %request.program, pid = child.id(), "sandbox: spawned");
 
-        Ok(Child::new(UnixChild::new(child)))
+        Ok(child)
     }
 }
 

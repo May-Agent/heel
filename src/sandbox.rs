@@ -298,15 +298,18 @@ impl<N: NetworkPolicy> Sandbox<N> {
 
         #[cfg(target_os = "linux")]
         if config_data.supervised_spawn() {
-            // The supervisor is `heel supervise`, started inside the sandbox, so
-            // the binary must be executable under the sandbox's own ruleset.
-            let heel_binary = resolve_heel_binary(
-                config_data.heel_binary().cloned(),
-                config_data.writable_paths(),
-            )
-            .await?;
-            config_data.set_supervisor_binary(heel_binary.as_path().to_path_buf());
-            config_data.push_grant(heel_binary, Access::EXEC);
+            if config_data.heel_binary().is_some() || std::env::var_os("HEEL_BIN").is_some() {
+                let heel_binary = resolve_heel_binary(
+                    config_data.heel_binary().cloned(),
+                    config_data.writable_paths(),
+                )
+                .await?;
+                config_data.set_supervisor_binary(heel_binary.as_path().to_path_buf());
+                config_data.push_grant(heel_binary, Access::EXEC);
+            } else if config_data.host_access() {
+                let heel_binary = resolve_heel_binary(None, config_data.writable_paths()).await?;
+                config_data.set_supervisor_binary(heel_binary.as_path().to_path_buf());
+            }
         }
 
         let (ipc_server, ipc_socket_dir) = match (router, config_data.external_ipc()) {
@@ -453,6 +456,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
             &self.process_tracker,
             self.proxy.as_ref().map(|proxy| ProxyEndpoint {
                 url: proxy.proxy_url(),
+                #[cfg(target_os = "windows")]
                 port: proxy.addr().port(),
             }),
             program,
@@ -479,6 +483,51 @@ impl<N: NetworkPolicy> Sandbox<N> {
     /// The policy-independent configuration this sandbox is running with.
     pub fn config(&self) -> &SandboxConfigData {
         &self.config_data
+    }
+
+    /// Handle to this sandbox's container runner, used to nest child sandboxes
+    /// on Linux via [`SandboxConfigBuilder::parent`](crate::SandboxConfigBuilder::parent).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn handle(&self) -> crate::platform::runner::SandboxHandle {
+        self.backend.handle()
+    }
+
+    /// Dynamically grant additional filesystem access to this live sandbox.
+    ///
+    /// On macOS, issues Seatbelt file extension tokens consumed by the
+    /// persistent in-sandbox runner. On Linux, updates the Landlock ruleset and
+    /// broker allowlist applied to subsequent commands in the container.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub async fn grant(&self, grants: impl IntoIterator<Item = crate::grant::Grant>) -> Result<()> {
+        let grants: Vec<crate::grant::Grant> = grants.into_iter().collect();
+        if grants.is_empty() {
+            return Ok(());
+        }
+        self.backend.grant(&grants)
+    }
+
+    /// Translate a PID observed inside this sandbox into its host PID, if the
+    /// process is currently alive.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn resolve_pid(&self, sandbox_pid: u32) -> Option<u32> {
+        self.backend.resolve_pid(sandbox_pid)
+    }
+
+    /// Translate a host PID into the PID visible inside this sandbox's PID
+    /// namespace (returns `None` on Linux if `host_pid` is outside this
+    /// container's namespace subtree, or on macOS if it is not a member of this
+    /// sandbox).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn pid_in_sandbox(&self, host_pid: u32) -> Option<u32> {
+        #[cfg(target_os = "macos")]
+        if !self.config_data.host_access() {
+            return matches!(
+                self.membership(host_pid),
+                Ok(crate::platform::macos::attribution::Membership::Member)
+            )
+            .then_some(host_pid);
+        }
+        self.backend.pid_in_sandbox(host_pid)
     }
 
     /// The sandbox working directory.
@@ -570,6 +619,15 @@ impl<N: NetworkPolicy> Drop for Sandbox<N> {
         }
 
         self.process_tracker.kill_all();
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        self.backend.shutdown();
+
+        #[cfg(target_os = "macos")]
+        if !self.config_data.host_access() {
+            crate::platform::macos::attribution::reap_members(self.attribution.paths());
+        }
+
         tracing::debug!("killed sandbox child processes");
 
         // `working_dir` is dropped after this, removing the directory.

@@ -28,6 +28,10 @@ jobs:
         with:
           shared-key: test-${{ matrix.os }}
 
+      - name: Allow unprivileged user namespaces on Ubuntu 24.04
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Build
         run: cargo build --verbose --all-features
 
