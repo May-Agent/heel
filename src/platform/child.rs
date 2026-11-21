@@ -63,6 +63,9 @@ pub(crate) type PlatformChild = crate::platform::windows::AppContainerChild;
 #[derive(Debug)]
 pub struct Child {
     inner: Option<PlatformChild>,
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
     tracker: Option<ProcessTracker>,
     pid: u32,
     sandbox_pid: u32,
@@ -78,11 +81,17 @@ fn consumed() -> io::Error {
 
 impl Child {
     /// Wrap a freshly spawned process.
-    pub(crate) fn new(inner: PlatformChild) -> Self {
+    pub(crate) fn new(mut inner: PlatformChild) -> Self {
         let pid = inner.id();
         let sandbox_pid = inner.sandbox_id();
+        let stdin = inner.stdin().take();
+        let stdout = inner.stdout().take();
+        let stderr = inner.stderr().take();
         Self {
             inner: Some(inner),
+            stdin,
+            stdout,
+            stderr,
             tracker: None,
             pid,
             sandbox_pid,
@@ -114,32 +123,32 @@ impl Child {
 
     /// Access the child's standard input.
     pub fn stdin(&mut self) -> Option<&mut File> {
-        self.inner.as_mut().and_then(|c| c.stdin().as_mut())
+        self.stdin.as_mut()
     }
 
     /// Access the child's standard output.
     pub fn stdout(&mut self) -> Option<&mut File> {
-        self.inner.as_mut().and_then(|c| c.stdout().as_mut())
+        self.stdout.as_mut()
     }
 
     /// Access the child's standard error.
     pub fn stderr(&mut self) -> Option<&mut File> {
-        self.inner.as_mut().and_then(|c| c.stderr().as_mut())
+        self.stderr.as_mut()
     }
 
     /// Take ownership of the child's standard input.
     pub fn take_stdin(&mut self) -> Option<File> {
-        self.inner.as_mut().and_then(|c| c.stdin().take())
+        self.stdin.take()
     }
 
     /// Take ownership of the child's standard output.
     pub fn take_stdout(&mut self) -> Option<File> {
-        self.inner.as_mut().and_then(|c| c.stdout().take())
+        self.stdout.take()
     }
 
     /// Take ownership of the child's standard error.
     pub fn take_stderr(&mut self) -> Option<File> {
-        self.inner.as_mut().and_then(|c| c.stderr().take())
+        self.stderr.take()
     }
 
     /// The process ID on the host.
@@ -199,9 +208,9 @@ impl Child {
         let mut inner = self.inner.take().ok_or_else(consumed)?;
 
         // Closing standard input releases a child that is blocked reading it.
-        drop(inner.stdin().take());
-        let stdout = inner.stdout().take();
-        let stderr = inner.stderr().take();
+        drop(self.stdin.take());
+        let stdout = self.stdout.take();
+        let stderr = self.stderr.take();
 
         let output = unblock(move || -> io::Result<Output> {
             let (status, stdout, stderr) = std::thread::scope(|scope| {

@@ -470,3 +470,65 @@ async fn a_command_that_cannot_start_is_a_typed_spawn_error_in_both_modes() {
         other => panic!("expected a spawn failure, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn supervised_children_preserve_piped_stdio_and_broker_pool_survives_set_grants() {
+    use heel::{Access, Grant, ReadDenylist, StdioConfig};
+    use std::io::{Read, Write};
+
+    let dir = fixtures::tempdir();
+    let secret = dir.path().join("secret.txt");
+    let extra = fixtures::tempdir();
+    std::fs::write(&secret, b"nope").unwrap();
+
+    let config = SandboxConfigBuilder::default()
+        .writable(fixtures::resolved(dir.path()))
+        .read_denylist(ReadDenylist::credentials().deny(&secret))
+        .heel_binary(heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"))
+        .supervised_spawn(true)
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    sandbox
+        .set_grants(
+            [
+                Grant::new(fixtures::resolved(dir.path()), Access::READ | Access::WRITE),
+                Grant::new(
+                    fixtures::resolved(extra.path()),
+                    Access::READ | Access::WRITE,
+                ),
+            ],
+            Vec::new(),
+        )
+        .await
+        .expect("set_grants updates broker pool without EBADFD");
+
+    let mut child = sandbox
+        .command("/bin/sh")
+        .args(["-c", "cat; echo err-line >&2"])
+        .stdin(StdioConfig::Piped)
+        .stdout(StdioConfig::Piped)
+        .stderr(StdioConfig::Piped)
+        .spawn_supervised(Foreground { reap_timeout: REAP })
+        .await
+        .expect("supervised child spawns");
+
+    let mut stdin = child.take_stdin().expect("stdin pipe preserved");
+    let mut stdout = child.take_stdout().expect("stdout pipe preserved");
+    let mut stderr = child.take_stderr().expect("stderr pipe preserved");
+
+    stdin.write_all(b"hello-supervised\n").unwrap();
+    drop(stdin);
+
+    let exit = bounded("supervised cat", child.wait()).await.unwrap();
+    assert!(exit.status.success());
+
+    let mut out = String::new();
+    stdout.read_to_string(&mut out).unwrap();
+    let mut err = String::new();
+    stderr.read_to_string(&mut err).unwrap();
+    assert_eq!(out, "hello-supervised\n");
+    assert_eq!(err, "err-line\n");
+}

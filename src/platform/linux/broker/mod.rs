@@ -74,11 +74,17 @@ use sink::DenialSink;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use filter::x32_refusal;
 
-/// A seccomp listener socket handed to the launcher thread.
-struct AcceptJob {
-    listener_socket: OwnedFd,
-    guard: Arc<Guard>,
-    reply: SyncSender<io::Result<()>>,
+/// Jobs executed in order by the launcher thread over `home.socket`.
+enum LauncherJob {
+    Accept {
+        listener_socket: OwnedFd,
+        guard: Arc<Guard>,
+        reply: SyncSender<io::Result<()>>,
+    },
+    GrantPool {
+        ruleset_fd: OwnedFd,
+        reply: Sender<Result<()>>,
+    },
 }
 
 /// The broker of one sandbox.
@@ -86,9 +92,7 @@ pub(crate) struct Broker {
     program_bytes: RwLock<Vec<u8>>,
     /// Dropping the broker drops this, which ends the launcher, which closes its
     /// end of the home thread's socket and so ends the home thread.
-    jobs: Sender<AcceptJob>,
-    /// Commands sent directly to `home` (e.g. granting remaining pool inodes).
-    home_commands: Sender<home::HomeCommand>,
+    jobs: Sender<LauncherJob>,
     /// Current policy guard snapshot cloned into each newly spawned command.
     guard: RwLock<Arc<Guard>>,
     /// Directories holding pre-created inode pools, preserved across policy updates.
@@ -329,7 +333,6 @@ impl Broker {
             Self {
                 program_bytes,
                 jobs,
-                home_commands,
                 guard,
                 pool_dirs,
                 denylists,
@@ -372,7 +375,7 @@ impl Broker {
         let guard = Arc::clone(&self.guard.read().unwrap_or_else(PoisonError::into_inner));
         let (reply, result) = sync_channel(1);
         self.jobs
-            .send(AcceptJob {
+            .send(LauncherJob::Accept {
                 listener_socket,
                 guard,
                 reply,
@@ -425,14 +428,15 @@ impl Broker {
         let (carved, new_guard) = outcome?;
         let sandbox_rules = without_writes(&carved.rules, abi);
         let ruleset = landlock_rules::instantiate(&sandbox_rules, proxy_port, abi)?;
+        let ruleset_fd = ruleset.duplicate_fd()?;
         let (reply_tx, reply_rx) = channel();
-        self.home_commands
-            .send(home::HomeCommand::GrantPool {
-                ruleset,
+        self.jobs
+            .send(LauncherJob::GrantPool {
+                ruleset_fd,
                 reply: reply_tx,
             })
-            .map_err(|_| Error::InitFailed("the broker's home thread exited".to_owned()))?;
-        let ruleset = reply_rx
+            .map_err(|_| Error::InitFailed("the broker's launcher exited".to_owned()))?;
+        reply_rx
             .recv()
             .map_err(|_| Error::InitFailed("the broker's home thread exited".to_owned()))??;
         let new_program = encode_coverage_program(Coverage {
@@ -526,7 +530,7 @@ fn hand_over_listener(
 /// hands them to the home thread.
 ///
 /// Ends when the broker is dropped and the queue of jobs is empty.
-fn launcher(launch: Launch, queue: &Receiver<AcceptJob>, ready: &SyncSender<io::Result<()>>) {
+fn launcher(launch: Launch, queue: &Receiver<LauncherJob>, ready: &SyncSender<io::Result<()>>) {
     let home = match start_home(launch) {
         Ok(home) => home,
         Err(error) => {
@@ -536,8 +540,25 @@ fn launcher(launch: Launch, queue: &Receiver<AcceptJob>, ready: &SyncSender<io::
     };
     let _ = ready.send(Ok(()));
     for job in queue {
-        let outcome = hand_over_listener(&home, job.guard, &job.listener_socket);
-        let _ = job.reply.send(outcome);
+        match job {
+            LauncherJob::Accept {
+                listener_socket,
+                guard,
+                reply,
+            } => {
+                let outcome = hand_over_listener(&home, guard, &listener_socket);
+                let _ = reply.send(outcome);
+            }
+            LauncherJob::GrantPool { ruleset_fd, reply } => {
+                if home
+                    .commands
+                    .send(home::HomeCommand::GrantPool { reply })
+                    .is_ok()
+                {
+                    let _ = table::send_fds(home.socket.as_fd(), &[ruleset_fd.as_fd()]);
+                }
+            }
+        }
     }
 }
 
