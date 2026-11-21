@@ -373,3 +373,65 @@ async fn a_configured_path_removed_before_creation_fails_sandbox_creation() {
         "the error must name the path: {error}"
     );
 }
+
+#[tokio::test]
+async fn unix_sockets_connect_in_writable_grants_and_honor_read_denylist() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    let home_dir = fixtures::tempdir();
+    let home = std::fs::canonicalize(home_dir.path()).expect("canonical home");
+    let allowed_dir = fixtures::tempdir();
+    let denied_dir = fixtures::tempdir();
+    let allowed_sock = std::fs::canonicalize(allowed_dir.path())
+        .expect("canonical allowed dir")
+        .join("allowed.sock");
+    let denied_sock = std::fs::canonicalize(denied_dir.path())
+        .expect("canonical denied dir")
+        .join("agent.sock");
+
+    let allowed_listener = UnixListener::bind(&allowed_sock).expect("bind allowed socket");
+    let _denied_listener = UnixListener::bind(&denied_sock).expect("bind denied socket");
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = allowed_listener.accept().expect("accept");
+        let mut buf = [0_u8; 4];
+        stream.read_exact(&mut buf).expect("read ping");
+        assert_eq!(&buf, b"ping");
+        stream.write_all(b"pong").expect("write pong");
+    });
+
+    let config = SandboxConfigBuilder::default()
+        .writable(fixtures::resolved(allowed_dir.path()))
+        .read_denylist(
+            heel::ReadDenylist::credentials()
+                .home(&home)
+                .socket(&denied_sock),
+        )
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    let connect_script = |sock: &std::path::Path| {
+        format!(
+            "python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX); s.settimeout(2.0); s.connect(sys.argv[1]); s.sendall(b\"ping\"); sys.stdout.write(s.recv(4).decode())' '{}'",
+            sock.display()
+        )
+    };
+
+    let ok = sh(&sandbox, &connect_script(&allowed_sock)).await;
+    assert!(
+        ok.status.success(),
+        "connecting to a Unix socket in a writable grant must succeed: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "pong");
+    server.join().expect("server thread");
+
+    let denied = sh(&sandbox, &connect_script(&denied_sock)).await;
+    assert!(
+        !denied.status.success(),
+        "connecting to a denylisted Unix socket must fail"
+    );
+}

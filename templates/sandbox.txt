@@ -236,6 +236,8 @@
 (allow file-write* ({{ grant.filter }} "{{ grant.path }}"))
 (allow file-write-create ({{ grant.filter }} "{{ grant.path }}"))
 (allow file-write-unlink ({{ grant.filter }} "{{ grant.path }}"))
+(allow network-outbound ({{ grant.filter }} "{{ grant.path }}"))
+(allow network-inbound ({{ grant.filter }} "{{ grant.path }}"))
 {% endif %}
 {% if grant.executable %}
 (allow process-exec ({{ grant.filter }} "{{ grant.path }}"))
@@ -248,10 +250,10 @@
 ; before the working directory and Pass 4 host protections so host protections
 ; still override them.
 (allow file-read* (extension "heel.grant.read"))
-(allow file-read* file-write* file-write-create file-write-unlink (extension "heel.grant.write"))
+(allow file-read* file-write* file-write-create file-write-unlink network-outbound network-inbound (extension "heel.grant.write"))
 (deny process-exec (extension "heel.grant.write"))
 (allow file-read* file-map-executable process-exec (extension "heel.grant.exec"))
-(allow file-read* file-write* file-write-create file-write-unlink file-map-executable process-exec (extension "heel.grant.write-exec"))
+(allow file-read* file-write* file-write-create file-write-unlink network-outbound network-inbound file-map-executable process-exec (extension "heel.grant.write-exec"))
 
 {% if let Some(runner) = runner_executable %}
 ; Persistent sandbox runner binary staged by the host for this sandbox alone.
@@ -268,6 +270,8 @@
 (allow file-write* (subpath "{{ working_dir }}"))
 (allow file-write-create (subpath "{{ working_dir }}"))
 (allow file-write-unlink (subpath "{{ working_dir }}"))
+(allow network-outbound (subpath "{{ working_dir }}"))
+(allow network-inbound (subpath "{{ working_dir }}"))
 {% if executable_working_dir %}
 ; A native binary must map into memory before the kernel execs it — allow
 ; the map too, or exec dies with a bare SIGKILL.

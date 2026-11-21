@@ -694,14 +694,19 @@ mod tests {
 
     #[test]
     fn deny_all_profile_has_no_outbound_rule() {
-        let (data, _dir) = prepared_config(SandboxConfig::new());
+        let (data, dir) = prepared_config(SandboxConfig::new());
         let profile = generate_profile(&data, None).unwrap();
+        let working_dir = std::fs::canonicalize(dir.path()).unwrap();
 
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default (with message"));
         assert!(profile.contains("(deny network*)"));
         assert!(profile.contains("(allow network-inbound (local tcp \"localhost:*\"))"));
-        assert!(!profile.contains("network-outbound"));
+        assert!(!profile.contains("(allow network-outbound (remote ip"));
+        assert!(profile.contains(&format!(
+            "(allow network-outbound (subpath \"{}\"))",
+            working_dir.display()
+        )));
     }
 
     #[test]
