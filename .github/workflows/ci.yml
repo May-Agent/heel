@@ -165,20 +165,6 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  unused-deps:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    name: Unused Dependencies
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
-      - uses: taiki-e/install-action@cargo-machete
-      - run: cargo machete
-
   feature-checks:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -205,7 +191,7 @@ jobs:
     # was skipped.
     name: CI result
     if: always()
-    needs: [changes, lint, cross-lint, coverage, audit, unused-deps, feature-checks, test]
+    needs: [changes, lint, cross-lint, coverage, audit, feature-checks, test]
     runs-on: ubuntu-latest
     steps:
       - name: Check job results

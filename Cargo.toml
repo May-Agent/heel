@@ -24,6 +24,9 @@ dbg_macro = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
 
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+
 [package]
 name = "heel"
 version = "0.10.1"
@@ -87,9 +90,6 @@ smol = "2"
 # Compile-time templates
 askama = "0.12"
 
-# Terminal raw mode
-crossterm = "0.29"
-
 # I/O polling for non-blocking operations
 polling = "3"
 
@@ -113,6 +113,7 @@ errno = "0.3"
 # PTY support for interactive shells
 [target.'cfg(target_os = "macos")'.dependencies]
 pty-process = "0.5"
+crossterm = "0.29"
 
 # Python executable detection (optional)
 [dependencies.which]
