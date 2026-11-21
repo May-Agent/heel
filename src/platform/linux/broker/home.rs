@@ -245,9 +245,7 @@ pub(super) enum HomeCommand {
         guard: Arc<Guard>,
     },
     GrantPool {
-        ruleset: crate::platform::linux::landlock_rules::PreparedRuleset,
-        reply:
-            Sender<crate::error::Result<crate::platform::linux::landlock_rules::PreparedRuleset>>,
+        reply: Sender<crate::error::Result<()>>,
     },
 }
 
@@ -342,20 +340,38 @@ pub(super) fn run(socket: &OwnedFd, mut setup: Setup, acknowledge: &Sender<io::R
                     return;
                 }
             },
-            HomeCommand::GrantPool { mut ruleset, reply } => {
-                let res = match &home.pool {
-                    Some(pool) => pool
-                        .grant_remaining(&mut |fd, access| {
+            HomeCommand::GrantPool { reply } => {
+                let res = (|| -> crate::error::Result<()> {
+                    let received = table::recv_fds(socket.as_fd())
+                        .map_err(|err| crate::error::Error::InitFailed(err.to_string()))?
+                        .ok_or_else(|| {
+                            crate::error::Error::InitFailed(
+                                "the launcher ended before sending the ruleset descriptor"
+                                    .to_owned(),
+                            )
+                        })?;
+                    let [ruleset_fd] = <[OwnedFd; 1]>::try_from(received).map_err(|_| {
+                        crate::error::Error::InitFailed(
+                            "expected a single ruleset descriptor".to_owned(),
+                        )
+                    })?;
+                    if let Some(pool) = &home.pool {
+                        pool.grant_remaining(&mut |fd, access| {
                             let access = access & reads;
                             if access.is_empty() {
                                 Ok(())
                             } else {
-                                ruleset.add_inode(fd, access, abi)
+                                crate::platform::linux::landlock_rules::add_inode_to_ruleset_fd(
+                                    ruleset_fd.as_fd(),
+                                    fd,
+                                    access,
+                                    abi,
+                                )
                             }
-                        })
-                        .map(|()| ruleset),
-                    None => Ok(ruleset),
-                };
+                        })?;
+                    }
+                    Ok(())
+                })();
                 let _ = reply.send(res);
             }
         }

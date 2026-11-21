@@ -78,6 +78,47 @@ impl PreparedRuleset {
     }
 }
 
+/// Add a `PATH_BENEATH` rule for `fd` onto a Landlock ruleset descriptor that
+/// arrived across a `CLONE_FILES` boundary via `SCM_RIGHTS`.
+pub(crate) fn add_inode_to_ruleset_fd(
+    ruleset_fd: BorrowedFd<'_>,
+    fd: BorrowedFd<'_>,
+    access: BitFlags<AccessFs>,
+    abi: ABI,
+) -> Result<()> {
+    #[repr(C, packed)]
+    struct PathBeneathAttr {
+        allowed_access: u64,
+        parent_fd: i32,
+    }
+    /// `LANDLOCK_RULE_PATH_BENEATH` in `<linux/landlock.h>`.
+    const LANDLOCK_RULE_PATH_BENEATH: libc::c_int = 1;
+
+    let access = effective_path_access(&fd, "an inode held open", access, abi)?;
+    let attr = PathBeneathAttr {
+        allowed_access: access.bits(),
+        parent_fd: fd.as_raw_fd(),
+    };
+    // SAFETY: `ruleset_fd` is a valid Landlock ruleset fd in the calling thread's
+    // descriptor table and `attr` matches `<linux/landlock.h>`.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset_fd.as_raw_fd(),
+            LANDLOCK_RULE_PATH_BENEATH,
+            &raw const attr,
+            0usize,
+        )
+    };
+    if rc < 0 {
+        return Err(Error::InvalidProfile(format!(
+            "Landlock rejected a rule for a held inode: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
 /// Verify that the running kernel supports the ABI this backend requires.
 ///
 /// Creating a ruleset is a single syscall, so this is a cheap, side-effect-free
