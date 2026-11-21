@@ -24,6 +24,9 @@ dbg_macro = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
 
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+
 [package]
 name = "heel"
 version = "0.10.1"
