@@ -26,43 +26,34 @@ pub(crate) struct PreparedFilter {
 }
 
 impl PreparedFilter {
-    /// Install the filters on the current process. Called from `pre_exec`.
-    ///
-    /// Safe to call there: the programs are compiled before forking, so this
-    /// only issues `prctl` and `seccomp` syscalls.
-    pub(crate) fn apply(self) -> std::io::Result<()> {
-        for program in &self.programs {
-            seccompiler::apply_filter(program).map_err(seccomp_error_to_io)?;
-        }
-        for program in &self.raw {
-            let fprog = libc::sock_fprog {
-                len: u16::try_from(program.len())
-                    .map_err(|_| std::io::Error::from_raw_os_error(libc::E2BIG))?,
-                filter: program.as_ptr().cast_mut(),
-            };
-            // SAFETY: `fprog` points at `len` instructions that outlive the call.
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_seccomp,
-                    libc::SECCOMP_SET_MODE_FILTER,
-                    0,
-                    &raw const fprog,
-                )
-            };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error());
+    /// Encode every BPF program into raw `sock_filter` byte slices for the runner.
+    pub(crate) fn encode_programs(&self) -> Vec<Vec<u8>> {
+        let encode_slice = |insns: &[libc::sock_filter]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(std::mem::size_of_val(insns));
+            for insn in insns {
+                out.extend_from_slice(&insn.code.to_ne_bytes());
+                out.push(insn.jt);
+                out.push(insn.jf);
+                out.extend_from_slice(&insn.k.to_ne_bytes());
             }
+            out
+        };
+        let mut list = Vec::with_capacity(self.programs.len() + self.raw.len());
+        for program in &self.programs {
+            // `seccompiler::SockFilter` has the exact layout of `libc::sock_filter`.
+            let mut out = Vec::with_capacity(program.len() * 8);
+            for insn in program {
+                out.extend_from_slice(&insn.code.to_ne_bytes());
+                out.push(insn.jt);
+                out.push(insn.jf);
+                out.extend_from_slice(&insn.k.to_ne_bytes());
+            }
+            list.push(out);
         }
-        Ok(())
-    }
-}
-
-fn seccomp_error_to_io(error: seccompiler::Error) -> std::io::Error {
-    match error {
-        seccompiler::Error::Prctl(source) | seccompiler::Error::Seccomp(source) => source,
-        seccompiler::Error::EmptyFilter => std::io::Error::from_raw_os_error(libc::EINVAL),
-        seccompiler::Error::ThreadSync(_) => std::io::Error::from_raw_os_error(libc::EIO),
-        other => std::io::Error::other(format!("seccomp apply_filter failed: {other}")),
+        for raw in &self.raw {
+            list.push(encode_slice(raw));
+        }
+        list
     }
 }
 

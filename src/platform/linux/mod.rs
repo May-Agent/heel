@@ -1,33 +1,43 @@
-//! Linux sandbox backend, built on Landlock and Seccomp.
+//! Linux sandbox backend, built on nested namespaces, Landlock and Seccomp.
 
 pub(crate) mod broker;
 mod landlock_rules;
 mod seccomp_filter;
 
-use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Child as StdChild, Command, Output};
-use std::sync::Arc;
-
-use blocking::unblock;
+use std::path::Path;
+use std::process::{Command, Output};
+use std::sync::{Arc, RwLock};
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
+use crate::grant::{Access, Grant};
 use crate::platform::child::unix::UnixChild;
 use crate::platform::preexec::PreExecSetup;
+use crate::platform::runner::{LinuxSpawnExtra, Runner, SandboxHandle};
 use crate::platform::{Backend, Child, SpawnRequest};
+use crate::resolve::ResolvedPath;
 
 /// Lowest kernel version with Landlock ABI v4.
 const MIN_KERNEL_VERSION: KernelVersion = KernelVersion::new(6, 7, 0);
 
-/// Linux sandbox backend using Landlock for files and network, Seccomp for
-/// syscalls.
+struct LiveRules {
+    config: SandboxConfigData,
+    ruleset: landlock_rules::PreparedRuleset,
+}
+
+/// Linux sandbox backend using a persistent namespace container (`userns` +
+/// `pidns` + `mountns`) per sandbox, Landlock for files and network, and
+/// Seccomp for syscalls.
 pub struct LinuxBackend {
+    /// Persistent in-namespace PID 1 runner (`None` under `host_access`).
+    runner: Option<Arc<Runner>>,
     /// The broker, when the configuration needs one.
     broker: Option<broker::Broker>,
-    /// The Landlock ruleset every command of the sandbox is restricted by, built
-    /// once with the sandbox. `None` under host access, which confines nothing.
-    ruleset: Option<landlock_rules::PreparedRuleset>,
+    /// Live configuration and Landlock ruleset (`None` under `host_access`).
+    live: Option<RwLock<LiveRules>>,
+    /// Encoded seccomp filter programs installed on every confined command.
+    seccomp_filters: Vec<Vec<u8>>,
     /// Where the denials the broker records are collected.
     sink: Arc<broker::sink::DenialSink>,
 }
@@ -74,22 +84,18 @@ impl std::fmt::Display for KernelVersion {
 }
 
 impl LinuxBackend {
-    /// Create the backend, verifying that the kernel can enforce the sandbox.
-    ///
-    /// Both checks are cheap syscalls. In particular, support is probed by
-    /// creating a ruleset rather than by forking a child and applying one:
-    /// forking a multi-threaded process and then allocating in the child is
-    /// unsound.
+    /// Create the backend, verifying kernel support and starting the persistent
+    /// PID-namespace container runner.
     pub fn new(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<Self> {
         let sink = Arc::new(broker::sink::DenialSink::default());
 
-        // Host access confines nothing: no Landlock, no seccomp, no broker, so
-        // the kernel is not probed and a host without Landlock still works.
         if config.host_access() {
             tracing::info!("Linux sandbox backend initialized (host access)");
             return Ok(Self {
+                runner: None,
                 broker: None,
-                ruleset: None,
+                live: None,
+                seccomp_filters: Vec::new(),
                 sink,
             });
         }
@@ -105,17 +111,104 @@ impl LinuxBackend {
 
         landlock_rules::probe_support()?;
 
-        let (broker, ruleset) = match broker::Broker::new(config, proxy_port, Arc::clone(&sink))? {
-            Some((broker, ruleset)) => (Some(broker), ruleset),
-            None => (None, landlock_rules::build_ruleset(config, proxy_port)?),
-        };
+        let runner = Runner::start_linux(config.parent())?;
+        let mut config = config.clone();
+        if let Some(exec_path) = runner.runner_executable() {
+            config.push_grant(ResolvedPath::new(exec_path)?, Access::EXEC);
+        }
+
+        let (broker, mut ruleset) =
+            match broker::Broker::new(&config, proxy_port, Arc::clone(&sink))? {
+                Some((broker, ruleset)) => (Some(broker), ruleset),
+                None => (None, landlock_rules::build_ruleset(&config, proxy_port)?),
+            };
+        if let Some(proc_fd) = runner.proc_fd() {
+            let proc_writable = config.writable_file_system() && broker.is_none();
+            ruleset.grant_private_proc(proc_fd, proc_writable)?;
+        }
+
+        let seccomp_filters = seccomp_filter::build_filter(proxy_port.is_some())?.encode_programs();
 
         tracing::info!(%kernel, broker = broker.is_some(), "Linux sandbox backend initialized");
         Ok(Self {
+            runner: Some(runner),
             broker,
-            ruleset: Some(ruleset),
+            live: Some(RwLock::new(LiveRules { config, ruleset })),
+            seccomp_filters,
             sink,
         })
+    }
+
+    /// Handle to this sandbox's container runner, for nesting child sandboxes.
+    pub(crate) fn handle(&self) -> SandboxHandle {
+        SandboxHandle {
+            runner: self.runner.clone(),
+        }
+    }
+
+    /// Path of the staged `heel-unix-runner` executable, when confined.
+    pub(crate) fn runner_executable(&self) -> Option<&Path> {
+        self.runner.as_deref().and_then(Runner::runner_executable)
+    }
+
+    /// Translate a sandbox-local PID to its host PID, if currently alive.
+    pub(crate) fn resolve_pid(&self, sandbox_pid: u32) -> Option<u32> {
+        match &self.runner {
+            Some(runner) => runner.resolve_pid(sandbox_pid),
+            None => Path::new(&format!("/proc/{sandbox_pid}"))
+                .exists()
+                .then_some(sandbox_pid),
+        }
+    }
+
+    /// Translate a host PID to the PID visible inside this sandbox's PID namespace.
+    pub(crate) fn pid_in_sandbox(&self, host_pid: u32) -> Option<u32> {
+        match &self.runner {
+            Some(runner) => runner.pid_in_sandbox(host_pid),
+            None => Path::new(&format!("/proc/{host_pid}"))
+                .exists()
+                .then_some(host_pid),
+        }
+    }
+
+    /// Dynamically grant `grants` to subsequent commands in this sandbox.
+    pub(crate) fn grant(&self, grants: &[Grant]) -> Result<()> {
+        let Some(live) = &self.live else {
+            return Ok(());
+        };
+        let mut guard = live
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut new_writable = Vec::new();
+        for grant in grants {
+            crate::platform::unresolved::verify(grant.path())?;
+            if grant.access().can_write() {
+                new_writable.push(grant.path());
+            }
+            guard
+                .config
+                .push_grant(grant.resolved_path().clone(), grant.access());
+        }
+        let LiveRules {
+            ref config,
+            ref mut ruleset,
+        } = *guard;
+        match &self.broker {
+            Some(broker) => broker.extend_ruleset(ruleset, config, &new_writable)?,
+            None => {
+                let plan = landlock_rules::plan(config);
+                ruleset.add_planned(&plan, landlock_rules::REQUIRED_ABI)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Shut down the persistent namespace container, triggering kernel
+    /// `zap_pid_ns_processes` across the entire process and sub-container tree.
+    pub(crate) fn shutdown(&self) {
+        if let Some(runner) = &self.runner {
+            runner.shutdown();
+        }
     }
 
     /// Where the denials the broker records are collected.
@@ -123,112 +216,107 @@ impl LinuxBackend {
         &self.sink
     }
 
-    /// Start a prepared command, through the broker's launcher when there is one.
-    fn start(&self, cmd: Command, listener: Option<OwnedFd>) -> std::io::Result<StdChild> {
-        match (&self.broker, listener) {
-            (Some(broker), Some(listener)) => broker.spawn(cmd, listener),
-            (None, None) => {
-                let mut cmd = cmd;
-                cmd.spawn()
-            }
-            _ => unreachable!("a command is prepared for the broker exactly when there is one"),
-        }
-    }
-
-    /// Turn a spawn request into a configured command.
-    fn build_command(&self, request: &SpawnRequest<'_>) -> Result<(Command, Option<OwnedFd>)> {
-        // Built here, on the host, so that the post-fork path only issues
-        // syscalls. A duplicate of the sandbox's ruleset descriptor: the ruleset
-        // itself, pool rules included, was built once with the sandbox.
-        let mut ruleset = self
-            .ruleset
-            .as_ref()
-            .map(landlock_rules::PreparedRuleset::try_clone)
-            .transpose()?;
-        let (hook, listener) = match &self.broker {
-            Some(broker) => {
-                let (hook, listener) = broker.prepare()?;
-                (Some(hook), Some(listener))
-            }
-            None => (None, None),
-        };
-        let allow_tcp = request.proxy_port.is_some();
-        // Host access installs no filter at all: the process keeps the
-        // invoking user's syscalls, including every socket family.
-        let mut filter = (!request.config.host_access())
-            .then(|| seccomp_filter::build_filter(allow_tcp))
-            .transpose()?;
+    fn build_host_command(&self, request: &SpawnRequest<'_>) -> Result<Command> {
         let setup = PreExecSetup::new(request.config)?;
-
         let mut cmd = Command::new(request.program);
         cmd.args(request.args);
         cmd.current_dir(request.working_dir());
-
         cmd.env_clear();
-        for var in request.config.env_passthrough() {
-            if let Ok(value) = std::env::var(var) {
-                cmd.env(var, value);
-            }
-        }
-        for (key, value) in request.envs {
+        for (key, value) in merged_envs(request.config, request.envs) {
             cmd.env(key, value);
         }
 
-        if let Some(fd) = request.inherit_fd {
-            // SAFETY: `fcntl` is async-signal-safe and allocates nothing; the
-            // descriptor is open in the parent for the whole spawn, so it is
-            // open here too. Rust marks every descriptor close-on-exec, which
-            // is what this one is exempted from.
-            unsafe {
-                cmd.pre_exec(move || {
-                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-
-        // SAFETY: the closure only applies pre-built rulesets and filters and
-        // installs resource limits and scheduling priority, all of which are
-        // plain syscalls. Nothing here allocates or takes a lock, as
-        // `pre_exec` requires.
+        let inherit_fds: Vec<(std::os::fd::RawFd, i32)> = request.inherit_fds.to_vec();
+        // SAFETY: `pre_exec` only calls async-signal-safe `fcntl`, `dup2` and `setup.apply`.
         unsafe {
             cmd.pre_exec(move || {
-                // Before Landlock and seccomp, so the limits and the priority
-                // are in place whatever the rest of the hook restricts.
-                setup.apply()?;
-
-                // Both values are consumed on first use; under host access
-                // there is neither and the hook only applies the limits.
-                if let Some(ruleset) = ruleset.take() {
-                    ruleset.restrict_self()?;
+                for &(src_fd, dst_fd) in &inherit_fds {
+                    if src_fd == dst_fd {
+                        if libc::fcntl(dst_fd, libc::F_SETFD, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    } else if libc::dup2(src_fd, dst_fd) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
-
-                if let Some(hook) = &hook {
-                    hook.install()?;
-                }
-
-                if let Some(filter) = filter.take() {
-                    filter.apply()?;
-                }
-
-                Ok(())
+                setup.apply()
             });
         }
-
-        Ok((cmd, listener))
+        Ok(cmd)
     }
+
+    fn spawn_sync(&self, request: &SpawnRequest<'_>) -> Result<Child> {
+        if let (Some(runner), Some(live)) = (&self.runner, &self.live) {
+            use std::os::fd::AsFd;
+            let envs = merged_envs(request.config, request.envs);
+            let setup = PreExecSetup::new(request.config)?;
+            let (limits, nice, io_policy) = setup.raw_parts();
+            let ruleset_fd = live
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ruleset
+                .duplicate_fd()?;
+
+            let (notif_filter, broker_child_sock, broker_handoff) = match &self.broker {
+                Some(broker) => {
+                    let (parent_sock, child_sock) = broker.prepare_sockets()?;
+                    (
+                        broker.program_bytes(),
+                        Some(child_sock),
+                        Some((broker, parent_sock)),
+                    )
+                }
+                None => (&[][..], None, None),
+            };
+
+            let child = runner.spawn_command(
+                request.program,
+                request.args,
+                &envs,
+                request.working_dir(),
+                request.stdin,
+                request.stdout,
+                request.stderr,
+                &limits,
+                nice,
+                io_policy,
+                LinuxSpawnExtra {
+                    ruleset: Some(ruleset_fd.as_fd()),
+                    notif_filter,
+                    seccomp_filters: &self.seccomp_filters,
+                    broker_child_sock,
+                    broker_handoff,
+                    inherit_fds: request.inherit_fds,
+                },
+            )?;
+            return Ok(Child::new(UnixChild::from_runner(child)));
+        }
+
+        let mut cmd = self.build_host_command(request)?;
+        cmd.stdin(std::process::Stdio::from(request.stdin));
+        cmd.stdout(std::process::Stdio::from(request.stdout));
+        cmd.stderr(std::process::Stdio::from(request.stderr));
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        Ok(Child::new(UnixChild::new(child)))
+    }
+}
+
+fn merged_envs(config: &SandboxConfigData, envs: &[(String, String)]) -> Vec<(String, String)> {
+    let mut merged = Vec::with_capacity(config.env_passthrough().len() + envs.len());
+    for var in config.env_passthrough() {
+        if let Ok(value) = std::env::var(var) {
+            merged.push((var.clone(), value));
+        }
+    }
+    merged.extend_from_slice(envs);
+    merged
 }
 
 /// Where the kernel publishes its release string.
 const KERNEL_RELEASE_PATH: &str = "/proc/sys/kernel/osrelease";
 
 /// Read the running kernel's version.
-///
-/// Read from procfs rather than through `uname`, which keeps this free of both
-/// a dependency and an unsafe block for a value the kernel already exposes as
-/// text.
 fn detect_kernel_version() -> Result<KernelVersion> {
     let release = std::fs::read_to_string(KERNEL_RELEASE_PATH)
         .map_err(|error| Error::path(KERNEL_RELEASE_PATH, error))?;
@@ -239,16 +327,12 @@ impl Backend for LinuxBackend {
     async fn execute(&self, request: SpawnRequest<'_>) -> Result<Output> {
         tracing::debug!(program = %request.program, args = ?request.args, "sandbox: executing");
 
-        let (mut cmd, listener) = self.build_command(&request)?;
-        cmd.stdin(std::process::Stdio::from(request.stdin));
-        cmd.stdout(std::process::Stdio::from(request.stdout));
-        cmd.stderr(std::process::Stdio::from(request.stderr));
-
-        let child = self.start(cmd, listener)?;
-        let output = unblock(move || child.wait_with_output()).await?;
+        let program_name = request.program.to_owned();
+        let child = self.spawn(request).await?;
+        let output = child.wait_with_output().await?;
 
         tracing::debug!(
-            program = %request.program,
+            program = %program_name,
             exit_code = ?output.status.code(),
             success = output.status.success(),
             "sandbox: command completed"
@@ -260,17 +344,15 @@ impl Backend for LinuxBackend {
     async fn spawn(&self, request: SpawnRequest<'_>) -> Result<Child> {
         tracing::debug!(program = %request.program, args = ?request.args, "sandbox: spawning");
 
-        let (mut cmd, listener) = self.build_command(&request)?;
-        cmd.stdin(std::process::Stdio::from(request.stdin));
-        cmd.stdout(std::process::Stdio::from(request.stdout));
-        cmd.stderr(std::process::Stdio::from(request.stderr));
-        // Its own process group, so the whole tree can be killed at once.
-        cmd.process_group(0);
+        let child = self.spawn_sync(&request)?;
+        tracing::debug!(
+            program = %request.program,
+            host_pid = child.id(),
+            sandbox_pid = child.sandbox_id(),
+            "sandbox: spawned"
+        );
 
-        let child = self.start(cmd, listener)?;
-        tracing::debug!(program = %request.program, pid = child.id(), "sandbox: spawned");
-
-        Ok(Child::new(UnixChild::new(child)))
+        Ok(child)
     }
 }
 

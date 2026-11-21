@@ -137,7 +137,7 @@ const BUSY_BACKOFF: [std::time::Duration; 5] = [
 /// the write descriptor until it execs, and executing the file meanwhile fails
 /// with `ETXTBSY`. That failure is retried with a short bounded backoff; any
 /// other result, or a file still busy afterwards, is returned unchanged.
-fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+pub(crate) fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     for delay in BUSY_BACKOFF {
         match attempt() {
             Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {

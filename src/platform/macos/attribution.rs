@@ -291,6 +291,75 @@ pub(crate) fn membership(
     }
 }
 
+/// Freeze and kill every remaining process running under the sandbox carrying `paths`.
+///
+/// Orphans that called `setsid` and were reparented to `launchd` survive their
+/// command's process group and the persistent runner's exit, but retain the
+/// Seatbelt profile. Stopping members in a loop prevents a forking survivor
+/// from spawning new processes before `SIGKILL` lands.
+pub(crate) fn reap_members(paths: &MarkerPaths) {
+    let me = std::process::id();
+    let mut stopped = std::collections::BTreeSet::new();
+    for _ in 0..16 {
+        let mut newly_stopped = false;
+        for pid in list_all_pids() {
+            if pid == 0 || pid == me || stopped.contains(&pid) {
+                continue;
+            }
+            if matches!(membership(paths, pid), Ok(Membership::Member)) {
+                // SAFETY: `pid` was just verified to carry this sandbox's Seatbelt profile.
+                unsafe {
+                    let _ = libc::kill(pid as libc::pid_t, libc::SIGSTOP);
+                }
+                stopped.insert(pid);
+                newly_stopped = true;
+            }
+        }
+        if !newly_stopped {
+            break;
+        }
+    }
+    for pid in stopped {
+        if matches!(membership(paths, pid), Ok(Membership::Member)) {
+            // SAFETY: `pid` still carries this sandbox's Seatbelt profile.
+            unsafe {
+                let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+fn list_all_pids() -> Vec<u32> {
+    /// `<sys/proc_info.h>` `PROC_ALL_PIDS`.
+    const PROC_ALL_PIDS: u32 = 1;
+
+    // SAFETY: passing null buffer queries the byte size needed for all active PIDs.
+    let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    if bytes <= 0 {
+        return Vec::new();
+    }
+    let capacity = (bytes as usize / std::mem::size_of::<libc::pid_t>()).saturating_add(64);
+    let mut pids = vec![0 as libc::pid_t; capacity];
+    // SAFETY: `pids` is writable for `capacity * sizeof(pid_t)` bytes.
+    let filled = unsafe {
+        libc::proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    if filled <= 0 {
+        return Vec::new();
+    }
+    let count = (filled as usize / std::mem::size_of::<libc::pid_t>()).min(pids.len());
+    pids[..count]
+        .iter()
+        .copied()
+        .filter_map(|p| u32::try_from(p).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

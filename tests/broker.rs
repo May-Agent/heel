@@ -1982,118 +1982,46 @@ async fn a_flood_of_refusals_while_the_subscriber_is_stuck_delays_nothing_and_is
 }
 
 /// Once the sandbox is dropped the launcher is gone, and a descendant that
-/// outlived it is still served, and still heard.
-async fn sandbox_dropped_with_a_descendant_waiting<N: NetworkPolicy>(
-    sandbox: Sandbox<N>,
+/// Start a detached `setsid` descendant whose parent command has exited while
+/// `sandbox` remains alive, then release it through `go`.
+async fn spawn_orphaned_descendant_in_sandbox<N: NetworkPolicy>(
+    sandbox: &Sandbox<N>,
     go: &Path,
     then: &str,
-) -> Descendant {
-    // The broker reads a caller's memory, which Yama's `ptrace_scope` 1 allows
-    // only for a descendant. The descendant here outlives the sandbox's root
-    // process, so it stays this process's descendant only if this process
-    // adopts it: an embedder that wants to serve such a process is a subreaper.
-    // SAFETY: `prctl` takes integers by value.
-    let adopted = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-    assert_eq!(adopted, 0);
+) -> u32 {
     let output = sh(
-        &sandbox,
+        sandbox,
         &format!(
-            "(setsid sh -xc 'echo $$ > \"{0}.pid\"; while [ ! -e \"{0}\" ]; do sleep 0.1; done; {then}' </dev/null >/dev/null 2>\"{0}.trace\" &); \
-             while [ ! -s \"{0}.pid\" ]; do sleep 0.05; done; echo started",
+            "(setsid sh -xc 'echo $$ > \"{0}.pid\"; while [ ! -e \"{0}\" ]; do sleep 0.05; done; {then}' </dev/null >/dev/null 2>\"{0}.trace\" &); \
+             while [ ! -s \"{0}.pid\" ]; do sleep 0.02; done; echo started",
             go.display()
         ),
     )
     .await;
     assert_eq!(stdout(&output), "started", "{}", text(&output));
-    let mut descendant = Descendant {
-        pid: std::fs::read_to_string(go.with_extension("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap(),
-        trace: go.with_extension("trace"),
-        history: Vec::new(),
-    };
-    descendant.note("before the drop");
-    drop(sandbox);
-    descendant.note("right after the drop");
-    // The launcher and the home thread end with the sandbox; the descendant has
-    // not been told to go yet, so everything it does is after they are gone.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while broker_threads()
-        .iter()
-        .any(|(_, comm)| comm == "heel-launcher" || comm == HOME_THREAD)
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the launcher is still running: {:?}",
-            broker_threads()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    descendant.note("once the launcher was gone");
-    std::fs::write(go, "").unwrap();
-    descendant
-}
-
-/// The process a sandbox left behind, by its pid in this namespace.
-struct Descendant {
-    pid: i32,
-    /// What its shell traced.
-    trace: PathBuf,
-    /// Where it was at each step of the test.
-    history: Vec<String>,
-}
-
-impl Descendant {
-    fn note(&mut self, when: &str) {
-        self.history.push(format!("{when}: {}", self.now()));
-    }
-
-    /// Where the process was at each step and is now, for a failure to say.
-    fn whereabouts(&self) -> String {
-        format!(
-            "{}\nnow: {}\ntrace:\n{}",
-            self.history.join("\n"),
-            self.now(),
-            std::fs::read_to_string(&self.trace).unwrap_or_else(|error| format!("<{error}>"))
-        )
-    }
-
-    /// Its state, the system call it is in, and the broker's threads that are
-    /// left to serve it.
-    fn now(&self) -> String {
-        let read = |name: &str| {
-            std::fs::read_to_string(format!("/proc/{}/{name}", self.pid))
-                .unwrap_or_else(|error| format!("<{error}>"))
-        };
-        let state = read("status")
-            .lines()
-            .find(|line| line.starts_with("State:"))
-            .map_or_else(|| read("status"), str::to_owned);
-        format!(
-            "pid {}: {state}; syscall {}; broker threads {:?}",
-            self.pid,
-            read("syscall").trim(),
-            broker_threads()
-        )
-    }
+    std::fs::read_to_string(go.with_extension("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 #[tokio::test]
-async fn a_descendant_served_after_the_sandbox_is_dropped_is_still_heard() {
+async fn a_descendant_served_after_its_parent_command_exited_is_still_heard() {
     let directory = fixtures::tempdir();
     let log = capture::install(directory.path(), tracing::Level::DEBUG);
     let probe = probe();
     let (_guard, root) = home(&[".ssh/id_ed25519"]);
     let secret = root.join(".ssh/id_ed25519");
     let sandbox = start(protected(DenyAll, &root, &probe)).await;
-    sandbox_dropped_with_a_descendant_waiting(
-        sandbox,
-        &root.join("scratch/go"),
+    let go = root.join("scratch/go");
+    let _ns_pid = spawn_orphaned_descendant_in_sandbox(
+        &sandbox,
+        &go,
         &format!("cat \"{}\"", secret.display()),
     )
     .await;
+    std::fs::write(&go, "").unwrap();
 
     let (thread, text) = log
         .appears(
@@ -2104,6 +2032,7 @@ async fn a_descendant_served_after_the_sandbox_is_dropped_is_still_heard() {
     assert!(text.contains("broker: refused"), "{text}");
     assert_eq!(thread, "heel-broker-log");
     assert_eq!(log.misplaced(), Vec::<String>::new());
+    drop(sandbox);
     broker_threads_end(std::time::Duration::from_secs(30)).await;
 }
 
@@ -2355,25 +2284,44 @@ async fn dropping_a_sandbox_with_children_running_ends_every_broker_thread() {
 }
 
 #[tokio::test]
-async fn a_descendant_that_outlives_the_sandbox_is_served_until_it_ends() {
+async fn a_setsid_descendant_outliving_its_parent_command_is_served_and_killed_on_drop() {
     let probe = probe();
     let (_guard, root) = home(&[".ssh/id_ed25519"]);
-    let written = root.join("scratch/after-drop");
+    let written = root.join("scratch/after-parent");
+    let after_drop = root.join("scratch/after-drop");
     let sandbox = start(protected(DenyAll, &root, &probe)).await;
-    let descendant = sandbox_dropped_with_a_descendant_waiting(
-        sandbox,
-        &root.join("scratch/go"),
-        &format!("echo served > \"{}\"", written.display()),
+    let go = root.join("scratch/go");
+    let ns_pid = spawn_orphaned_descendant_in_sandbox(
+        &sandbox,
+        &go,
+        &format!(
+            "echo served > \"{}\"; while :; do sleep 0.1; done; echo escaped > \"{}\"",
+            written.display(),
+            after_drop.display()
+        ),
     )
     .await;
+    let host_pid = sandbox
+        .resolve_pid(ns_pid)
+        .expect("descendant is alive in container");
+    std::fs::write(&go, "").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::fs::read_to_string(&written).unwrap_or_default().trim() != "served" {
         assert!(
             std::time::Instant::now() < deadline,
-            "a descendant that outlived the sandbox lost its broker: {}",
-            descendant.whereabouts()
+            "an orphaned descendant inside the sandbox was not served by its broker"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    drop(sandbox);
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while Path::new(&format!("/proc/{host_pid}")).exists() {
+        assert!(
+            std::time::Instant::now() < reap_deadline,
+            "container teardown left setsid descendant {host_pid} alive"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!after_drop.exists());
     broker_threads_end(std::time::Duration::from_secs(30)).await;
 }

@@ -138,6 +138,8 @@ enum Ending {
 /// What the supervisor has said so far.
 #[derive(Debug, Default)]
 struct State {
+    /// PID of the user command inside its PID namespace, once spawned.
+    started_pid: Option<u32>,
     /// The latest teardown report.
     report: Option<TreeReport>,
     /// How many teardown reports have arrived.
@@ -157,6 +159,7 @@ impl State {
 
     fn apply(&mut self, event: Event) {
         match event {
+            Event::Started { pid } => self.started_pid = Some(pid),
             Event::Leftover(report) | Event::Killed(report) => {
                 self.report = Some(report);
                 self.reports += 1;
@@ -245,16 +248,28 @@ fn read_events(mut from_supervisor: BufReader<UnixStream>, mailbox: &Mailbox) {
     mailbox.update(|state| state.closed = true);
 }
 
+type ReaperFn = Box<dyn FnOnce() -> std::io::Result<ExitStatus> + Send>;
+
 /// The host's end of the control socket, shared by everything that talks to
 /// one supervisor.
-#[derive(Debug)]
 pub(crate) struct Shared {
     to_supervisor: UnixStream,
     mailbox: Arc<Mailbox>,
     reap_timeout: Duration,
+    /// Optional custom reaper (used when the supervisor lives inside a
+    /// persistent container runner rather than as a direct child of the host).
+    reaper: Mutex<Option<ReaperFn>>,
     /// The supervisor's exit status once it has been reaped. The one place the
     /// supervisor is waited for, whoever asks first.
     exit: Mutex<Option<ExitStatus>>,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("reap_timeout", &self.reap_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for Shared {
@@ -283,16 +298,29 @@ impl Shared {
             to_supervisor,
             mailbox,
             reap_timeout,
+            reaper: Mutex::new(None),
             exit: Mutex::new(None),
         }))
     }
 
+    /// Install the custom reaper for a supervisor spawned inside a persistent runner.
+    pub(crate) fn set_reaper(&self, reaper: ReaperFn) {
+        *self
+            .reaper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reaper);
+    }
+
+    /// Wait until the supervisor has either spawned its command (returning
+    /// `Some(sandbox_pid)`) or terminated before doing so (`None`).
+    pub(crate) fn wait_started(&self) -> Option<u32> {
+        let state = self
+            .mailbox
+            .wait_until(|s| s.started_pid.is_some() || s.ended());
+        state.started_pid
+    }
+
     /// Wait for the supervisor `pid` to exit and reap it, returning its status.
-    ///
-    /// Every wait for a supervised process goes through here: the waiter that
-    /// gets the lock first reaps, and the others receive the status it kept,
-    /// so none is left with `ECHILD`. The lock is held across the wait on
-    /// purpose; the only contenders are other waits for the same process.
     pub(crate) fn reap(&self, pid: u32) -> std::io::Result<ExitStatus> {
         let mut exit = self
             .exit
@@ -301,7 +329,15 @@ impl Shared {
         if let Some(status) = *exit {
             return Ok(status);
         }
-        let status = reap_child(pid)?;
+        let custom = self
+            .reaper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let status = match custom {
+            Some(reap_fn) => reap_fn()?,
+            None => reap_child(pid)?,
+        };
         *exit = Some(status);
         Ok(status)
     }
@@ -455,6 +491,8 @@ impl TreeControl {
 #[derive(Debug)]
 pub struct SupervisedChild<M: Supervision> {
     child: Child,
+    command_host_pid: u32,
+    command_sandbox_pid: u32,
     control: TreeControl,
     mode: PhantomData<M>,
 }
@@ -466,17 +504,35 @@ impl<M: Supervision> Drop for SupervisedChild<M> {
 }
 
 impl<M: Supervision> SupervisedChild<M> {
-    pub(crate) fn new(child: Child, shared: Arc<Shared>) -> Self {
+    pub(crate) fn new(
+        child: Child,
+        command_host_pid: u32,
+        command_sandbox_pid: u32,
+        shared: Arc<Shared>,
+    ) -> Self {
         Self {
             child,
+            command_host_pid,
+            command_sandbox_pid,
             control: TreeControl { shared },
             mode: PhantomData,
         }
     }
 
-    /// The supervisor's process id, which is the root of the tree.
+    /// The supervisor's process id on the host, which is the root of the tree.
     pub fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// The user command's process id on the host (for host `/proc` probes).
+    pub fn command_host_id(&self) -> u32 {
+        self.command_host_pid
+    }
+
+    /// The user command's process id inside the sandbox's PID namespace (what
+    /// commands inside the sandbox observe as `$$` and target with `kill`).
+    pub fn sandbox_id(&self) -> u32 {
+        self.command_sandbox_pid
     }
 
     /// The command's standard input, when it was piped.

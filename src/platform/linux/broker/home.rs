@@ -37,7 +37,7 @@ const MAX_WORKERS: usize = 256;
 /// What every thread that serves a sandbox shares.
 #[derive(Debug)]
 pub(crate) struct Shared {
-    pub(super) guard: Guard,
+    guard: Arc<RwLock<Guard>>,
     pub(super) pool: Option<Pool>,
     pub(super) sink: Arc<DenialSink>,
     rename_lock: RwLock<()>,
@@ -57,6 +57,11 @@ pub(crate) enum Held<'a> {
 }
 
 impl Shared {
+    /// Read access to the policy guard.
+    pub(crate) fn guard(&self) -> RwLockReadGuard<'_, Guard> {
+        self.guard.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Lock for serving `syscall`.
     pub(crate) fn hold_for(&self, syscall: Syscall) -> Held<'_> {
         // A connect to an inet address names no file and can take long, so it
@@ -221,7 +226,7 @@ fn serve(serving: &Arc<Serving>, notification: &libc::seccomp_notif) {
 
 /// What the home thread builds what it shares from.
 pub(super) struct Setup {
-    pub(super) guard: Guard,
+    pub(super) guard: Arc<RwLock<Guard>>,
     pub(super) pool: Option<PoolPlan>,
     pub(super) sink: Arc<DenialSink>,
     pub(super) proxy_port: Option<u16>,

@@ -21,8 +21,13 @@ use crate::sandbox::ProcessTracker;
 
 /// A live handle to one spawned process.
 pub(crate) trait ProcessHandle: Send + std::fmt::Debug + 'static {
-    /// The process identifier.
+    /// The process identifier on the host.
     fn id(&self) -> u32;
+
+    /// The process identifier as observed inside the sandbox.
+    fn sandbox_id(&self) -> u32 {
+        self.id()
+    }
 
     /// Block until the process exits.
     fn wait(&mut self) -> io::Result<ExitStatus>;
@@ -60,6 +65,7 @@ pub struct Child {
     inner: Option<PlatformChild>,
     tracker: Option<ProcessTracker>,
     pid: u32,
+    sandbox_pid: u32,
 }
 
 /// The error reported once a child has been waited on and its handle released.
@@ -74,10 +80,12 @@ impl Child {
     /// Wrap a freshly spawned process.
     pub(crate) fn new(inner: PlatformChild) -> Self {
         let pid = inner.id();
+        let sandbox_pid = inner.sandbox_id();
         Self {
             inner: Some(inner),
             tracker: None,
             pid,
+            sandbox_pid,
         }
     }
 
@@ -134,9 +142,28 @@ impl Child {
         self.inner.as_mut().and_then(|c| c.stderr().take())
     }
 
-    /// The process ID.
+    /// The process ID on the host.
     pub fn id(&self) -> u32 {
         self.pid
+    }
+
+    /// The process ID inside the sandbox's own PID namespace.
+    ///
+    /// On macOS, Windows, and host-access sandboxes this equals [`Child::id`].
+    /// On confined Linux sandboxes this is the PID observed by commands running
+    /// inside the sandbox (`$$`, `/proc`, and `kill`).
+    pub fn sandbox_id(&self) -> u32 {
+        self.sandbox_pid
+    }
+
+    /// Extract the underlying blocking waiter for a supervisor reaper.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_reaper(
+        &mut self,
+    ) -> Result<Box<dyn FnOnce() -> io::Result<ExitStatus> + Send>> {
+        let mut inner = self.inner.take().ok_or_else(consumed)?;
+        self.unregister();
+        Ok(Box::new(move || inner.wait()))
     }
 
     /// Wait for the child to exit.
@@ -243,15 +270,25 @@ fn drain(pipe: Option<File>) -> io::Result<Vec<u8>> {
 
 #[cfg(unix)]
 pub(crate) mod unix {
-    //! The process handle for backends that spawn through `std::process`.
+    //! The process handle for Unix backends (either direct `std::process` or a persistent runner).
 
     use std::os::fd::OwnedFd;
 
     use super::{ExitStatus, File, ProcessHandle, io};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::platform::runner::RunnerChild;
 
-    /// A child spawned by `std::process::Command`.
+    /// A child spawned either directly on the host or inside a persistent sandbox runner.
     #[derive(Debug)]
-    pub(crate) struct UnixChild {
+    pub(crate) enum UnixChild {
+        Direct(DirectUnixChild),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        Runner(RunnerChild),
+    }
+
+    /// A child spawned directly by `std::process::Command`.
+    #[derive(Debug)]
+    pub(crate) struct DirectUnixChild {
         inner: std::process::Child,
         stdin: Option<File>,
         stdout: Option<File>,
@@ -259,10 +296,8 @@ pub(crate) mod unix {
     }
 
     impl UnixChild {
-        /// Adopt a freshly spawned process.
+        /// Adopt a freshly spawned host process.
         pub(crate) fn new(mut inner: std::process::Child) -> Self {
-            // The stream types are pipes; converting once here is what lets the
-            // public API be the same on every platform.
             let stdin = inner
                 .stdin
                 .take()
@@ -275,56 +310,96 @@ pub(crate) mod unix {
                 .stderr
                 .take()
                 .map(|pipe| File::from(OwnedFd::from(pipe)));
-            Self {
+            Self::Direct(DirectUnixChild {
                 inner,
                 stdin,
                 stdout,
                 stderr,
-            }
+            })
+        }
+
+        /// Adopt a process spawned by the persistent in-sandbox runner.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        pub(crate) fn from_runner(child: RunnerChild) -> Self {
+            Self::Runner(child)
         }
     }
 
     impl ProcessHandle for UnixChild {
         fn id(&self) -> u32 {
-            self.inner.id()
+            match self {
+                Self::Direct(c) => c.inner.id(),
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::Runner(c) => c.id(),
+            }
+        }
+
+        fn sandbox_id(&self) -> u32 {
+            match self {
+                Self::Direct(c) => c.inner.id(),
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::Runner(c) => c.sandbox_id(),
+            }
         }
 
         fn wait(&mut self) -> io::Result<ExitStatus> {
-            self.inner.wait()
+            match self {
+                Self::Direct(c) => c.inner.wait(),
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::Runner(c) => c.wait(),
+            }
         }
 
         fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-            self.inner.try_wait()
+            match self {
+                Self::Direct(c) => c.inner.try_wait(),
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::Runner(c) => c.try_wait(),
+            }
         }
 
         fn kill(&mut self) -> io::Result<()> {
-            // SAFETY: a negative PID targets the process group created at
-            // spawn, which is this child and its descendants.
-            let result = unsafe { libc::kill(-(self.inner.id() as i32), libc::SIGKILL) };
-            if result != 0 {
-                let error = io::Error::last_os_error();
-                // ESRCH means the group is already gone, which is success here.
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error);
+            match self {
+                Self::Direct(c) => {
+                    // SAFETY: a negative PID targets the process group created at
+                    // spawn, which is this child and its descendants.
+                    let result = unsafe { libc::kill(-(c.inner.id() as i32), libc::SIGKILL) };
+                    if result != 0 {
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::ESRCH) {
+                            return Err(error);
+                        }
+                    }
+                    c.inner.wait()?;
+                    Ok(())
                 }
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::Runner(c) => c.kill(),
             }
-
-            // Reap, so the kernel releases the entry rather than leaving a
-            // zombie.
-            self.inner.wait()?;
-            Ok(())
         }
 
         fn stdin(&mut self) -> &mut Option<File> {
-            &mut self.stdin
+            match self {
+                Self::Direct(c) => &mut c.stdin,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::Runner(c) => c.stdin(),
+            }
         }
 
         fn stdout(&mut self) -> &mut Option<File> {
-            &mut self.stdout
+            match self {
+                Self::Direct(c) => &mut c.stdout,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::Runner(c) => c.stdout(),
+            }
         }
 
         fn stderr(&mut self) -> &mut Option<File> {
-            &mut self.stderr
+            match self {
+                Self::Direct(c) => &mut c.stderr,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::Runner(c) => c.stderr(),
+            }
         }
     }
 }

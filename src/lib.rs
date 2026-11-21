@@ -151,6 +151,8 @@ pub use network::{
 pub use platform::Child;
 #[cfg(target_os = "macos")]
 pub use platform::macos::attribution::{AttributionError, Membership};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use platform::runner::SandboxHandle;
 pub use policy::{ReadDenylist, WriteDenylist};
 pub use priority::{CpuPriority, InvalidNiceLevel, IoPriority, NiceLevel, ProcessPriority};
 pub use python::VenvManager;

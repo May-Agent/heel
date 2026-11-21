@@ -359,6 +359,9 @@ pub struct SandboxConfigData {
     /// created and executable inside it. `None` unless `supervised_spawn`.
     #[cfg(target_os = "linux")]
     supervisor_binary: Option<PathBuf>,
+    /// Parent sandbox container handle, when nesting a child container on Linux.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    parent: Option<crate::platform::runner::SandboxHandle>,
 }
 
 impl SandboxConfigData {
@@ -548,6 +551,12 @@ impl SandboxConfigData {
         self.supervisor_binary = Some(path);
     }
 
+    /// Parent sandbox container handle, if nested.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn parent(&self) -> Option<&crate::platform::runner::SandboxHandle> {
+        self.parent.as_ref()
+    }
+
     /// Replace the working directory with its canonical, created form.
     pub(crate) fn set_working_dir(&mut self, path: PathBuf) {
         self.working_dir = path;
@@ -723,6 +732,8 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 supervised_spawn: false,
                 #[cfg(target_os = "linux")]
                 supervisor_binary: None,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                parent: None,
             },
             ipc: None,
             ipc_state: std::marker::PhantomData,
@@ -948,6 +959,20 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
         self.data.priority = priority;
         self
     }
+
+    /// Nest this sandbox inside `parent`'s container on Linux (`CLONE_NEWPID |
+    /// CLONE_NEWNS` inside the parent's user and PID namespaces).
+    ///
+    /// Processes in `parent` see and may signal processes in this child
+    /// sandbox, while processes in this child sandbox cannot see or signal
+    /// `parent` or sibling sandboxes, and terminating `parent` tears down this
+    /// child container in the kernel. On macOS, where Seatbelt forbids nested
+    /// `sandbox_apply`, this sandbox runs as an isolated sibling profile.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn parent(mut self, parent: crate::platform::runner::SandboxHandle) -> Self {
+        self.data.parent = Some(parent);
+        self
+    }
 }
 
 impl<N: NetworkPolicy> SandboxConfigBuilder<N, IpcUnconfigured> {
@@ -1019,8 +1044,8 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N, IpcUnconfigured> {
 
 impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// Use a specific `heel` binary for the Linux supervisor
-    /// ([`supervised_spawn`](Self::supervised_spawn)), the one thing that still
-    /// executes `heel` inside a sandbox.
+    /// (`supervised_spawn`), the one thing that still executes `heel` inside a
+    /// sandbox.
     ///
     /// The binary is already verified to match the library's version
     /// ([`HeelBinary::verify`](crate::HeelBinary::verify)), so creating a

@@ -142,6 +142,8 @@ jobs:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
+      - name: Allow unprivileged user namespaces on Ubuntu 24.04
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5.5.4
         with:

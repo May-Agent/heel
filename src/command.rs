@@ -93,6 +93,7 @@ pub struct Command<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct ProxyEndpoint {
     pub(crate) url: String,
+    #[cfg(target_os = "windows")]
     pub(crate) port: u16,
 }
 
@@ -195,6 +196,7 @@ impl<'a> Command<'a> {
     ) -> SpawnRequest<'r> {
         SpawnRequest {
             config: self.config,
+            #[cfg(target_os = "windows")]
             proxy_port: self.proxy.as_ref().map(|proxy| proxy.port),
             program: &self.program,
             args: &self.args,
@@ -204,7 +206,7 @@ impl<'a> Command<'a> {
             stdout,
             stderr,
             #[cfg(target_os = "linux")]
-            inherit_fd: None,
+            inherit_fds: &[],
         }
     }
 
@@ -282,6 +284,87 @@ impl<'a> Command<'a> {
     ) -> Result<crate::supervisor::SupervisedChild<M>> {
         use std::os::fd::AsRawFd;
 
+        if !self.config.supervised_spawn() {
+            return Err(crate::error::Error::SupervisorNotConfigured);
+        }
+
+        let (host, supervisor_end) = std::os::unix::net::UnixStream::pair()?;
+        let inherited_ctl =
+            rustix::io::fcntl_dupfd_cloexec(&supervisor_end, 3).map_err(std::io::Error::from)?;
+        drop(supervisor_end);
+        let shared = crate::supervisor::Shared::new(host, mode.reap_timeout())?;
+        let envs = self.build_envs();
+
+        if let Some(runner_bin) = self.backend.runner_executable() {
+            let runner_str = runner_bin.to_str().ok_or_else(|| {
+                crate::error::Error::InitFailed(format!(
+                    "runner binary path is not UTF-8: {}",
+                    runner_bin.display()
+                ))
+            })?;
+            let (cred_read, cred_write) = std::os::unix::net::UnixStream::pair()?;
+            crate::platform::runner::enable_passcred(cred_read.as_raw_fd())?;
+            let inherited_cred =
+                rustix::io::fcntl_dupfd_cloexec(&cred_write, 4).map_err(std::io::Error::from)?;
+            drop(cred_write);
+
+            let ctl_target = 3i32;
+            let cred_target = 4i32;
+            let reap_ms = mode.reap_timeout().as_millis().to_string();
+            let mut arguments = Vec::with_capacity(6 + self.args.len());
+            arguments.push("--supervise".to_owned());
+            arguments.push(mode.mode().as_str().to_owned());
+            arguments.push(ctl_target.to_string());
+            arguments.push(cred_target.to_string());
+            arguments.push(reap_ms);
+            arguments.push("--".to_owned());
+            arguments.push(self.program.clone());
+            arguments.extend_from_slice(&self.args);
+
+            let inherit_pairs = [
+                (inherited_ctl.as_raw_fd(), ctl_target),
+                (inherited_cred.as_raw_fd(), cred_target),
+            ];
+            let request = SpawnRequest {
+                config: self.config,
+                program: runner_str,
+                args: &arguments,
+                envs: &envs,
+                current_dir: self.current_dir.as_deref(),
+                stdin: self.stdio(self.stdin),
+                stdout: self.stdio(self.stdout),
+                stderr: self.stdio(self.stderr),
+                inherit_fds: &inherit_pairs,
+            };
+            let mut child = self.backend.spawn(request).await?;
+            drop((inherited_ctl, inherited_cred));
+
+            let sup_pid = child.id();
+            let reaper = child.take_reaper()?;
+            shared.set_reaper(reaper);
+
+            let wait_shared = std::sync::Arc::clone(&shared);
+            let (cmd_sandbox_pid, cmd_host_pid) = blocking::unblock(move || {
+                if let Some(spid) = wait_shared.wait_started() {
+                    let hpid =
+                        crate::platform::runner::read_cred_pid(&cred_read).unwrap_or(sup_pid);
+                    (spid, hpid)
+                } else {
+                    (sup_pid, sup_pid)
+                }
+            })
+            .await;
+
+            self.process_tracker
+                .register_supervisor(sup_pid, std::sync::Arc::downgrade(&shared));
+            return Ok(crate::supervisor::SupervisedChild::new(
+                child,
+                cmd_host_pid,
+                cmd_sandbox_pid,
+                shared,
+            ));
+        }
+
         let binary = self
             .config
             .supervisor_binary()
@@ -292,27 +375,16 @@ impl<'a> Command<'a> {
                 binary.display()
             ))
         })?;
-        let (host, supervisor_end) = std::os::unix::net::UnixStream::pair()?;
-        // Above the standard streams: `std` installs those over the child's
-        // descriptors 0-2 before `exec`, which would replace the socket if it
-        // had landed on one of them (a host started with a stream closed).
-        let inherited =
-            rustix::io::fcntl_dupfd_cloexec(&supervisor_end, 3).map_err(std::io::Error::from)?;
-        // Our only other copy of it, closed so the host sees the supervisor's
-        // exit as the end of the stream.
-        drop(supervisor_end);
-        let shared = crate::supervisor::Shared::new(host, mode.reap_timeout())?;
         let arguments = crate::supervisor::arguments(
             mode.mode(),
-            inherited.as_raw_fd(),
+            inherited_ctl.as_raw_fd(),
             mode.reap_timeout(),
             &self.program,
             &self.args,
         );
-        let envs = self.build_envs();
+        let inherit_pairs = [(inherited_ctl.as_raw_fd(), inherited_ctl.as_raw_fd())];
         let request = SpawnRequest {
             config: self.config,
-            proxy_port: self.proxy.as_ref().map(|proxy| proxy.port),
             program: binary,
             args: &arguments,
             envs: &envs,
@@ -320,18 +392,22 @@ impl<'a> Command<'a> {
             stdin: self.stdio(self.stdin),
             stdout: self.stdio(self.stdout),
             stderr: self.stdio(self.stderr),
-            inherit_fd: Some(inherited.as_raw_fd()),
+            inherit_fds: &inherit_pairs,
         };
         let child = self.backend.spawn(request).await?;
-        // The supervisor holds its end now; keeping ours would hide its exit.
-        drop(inherited);
+        drop(inherited_ctl);
 
-        // Dropping the sandbox ends the tree through the supervisor, not by
-        // signalling its process group.
+        let sup_pid = child.id();
+        let wait_shared = std::sync::Arc::clone(&shared);
+        let cmd_pid =
+            blocking::unblock(move || wait_shared.wait_started().unwrap_or(sup_pid)).await;
+
         self.process_tracker
-            .register_supervisor(child.id(), std::sync::Arc::downgrade(&shared));
+            .register_supervisor(sup_pid, std::sync::Arc::downgrade(&shared));
         let child = child.with_tracker(self.process_tracker.clone());
-        Ok(crate::supervisor::SupervisedChild::new(child, shared))
+        Ok(crate::supervisor::SupervisedChild::new(
+            child, cmd_pid, cmd_pid, shared,
+        ))
     }
 }
 

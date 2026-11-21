@@ -45,6 +45,16 @@ impl PreExecSetup {
         self.limits.is_empty() && self.priority.is_empty()
     }
 
+    /// Flatten into raw values sent across the runner control socket.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn raw_parts(&self) -> (Vec<(i32, u64)>, Option<i32>, Option<i32>) {
+        (
+            self.limits.raw_pairs(),
+            self.priority.nice,
+            self.priority.io_policy,
+        )
+    }
+
     /// Install everything on the current process.
     ///
     /// Safe to call from `pre_exec`: it only issues `setrlimit`, `setpriority`
