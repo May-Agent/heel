@@ -375,14 +375,20 @@ async fn a_configured_path_removed_before_creation_fails_sandbox_creation() {
 }
 
 #[tokio::test]
-async fn unix_sockets_connect_in_writable_grants_and_are_denied_outside() {
+async fn unix_sockets_connect_in_writable_grants_and_honor_read_denylist() {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
 
+    let home_dir = fixtures::tempdir();
+    let home = std::fs::canonicalize(home_dir.path()).expect("canonical home");
     let allowed_dir = fixtures::tempdir();
     let denied_dir = fixtures::tempdir();
-    let allowed_sock = allowed_dir.path().join("allowed.sock");
-    let denied_sock = denied_dir.path().join("denied.sock");
+    let allowed_sock = std::fs::canonicalize(allowed_dir.path())
+        .expect("canonical allowed dir")
+        .join("allowed.sock");
+    let denied_sock = std::fs::canonicalize(denied_dir.path())
+        .expect("canonical denied dir")
+        .join("agent.sock");
 
     let allowed_listener = UnixListener::bind(&allowed_sock).expect("bind allowed socket");
     let _denied_listener = UnixListener::bind(&denied_sock).expect("bind denied socket");
@@ -397,6 +403,11 @@ async fn unix_sockets_connect_in_writable_grants_and_are_denied_outside() {
 
     let config = SandboxConfigBuilder::default()
         .writable(fixtures::resolved(allowed_dir.path()))
+        .read_denylist(
+            heel::ReadDenylist::credentials()
+                .home(&home)
+                .socket(&denied_sock),
+        )
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -404,7 +415,7 @@ async fn unix_sockets_connect_in_writable_grants_and_are_denied_outside() {
 
     let connect_script = |sock: &std::path::Path| {
         format!(
-            "python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b\"ping\"); sys.stdout.write(s.recv(4).decode())' '{}'",
+            "python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX); s.settimeout(2.0); s.connect(sys.argv[1]); s.sendall(b\"ping\"); sys.stdout.write(s.recv(4).decode())' '{}'",
             sock.display()
         )
     };
@@ -421,6 +432,6 @@ async fn unix_sockets_connect_in_writable_grants_and_are_denied_outside() {
     let denied = sh(&sandbox, &connect_script(&denied_sock)).await;
     assert!(
         !denied.status.success(),
-        "connecting to a Unix socket outside granted paths must fail"
+        "connecting to a denylisted Unix socket must fail"
     );
 }
