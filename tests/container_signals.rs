@@ -194,6 +194,13 @@ async fn nested_linux_container_allows_parent_to_child_signals_denies_reverse_an
     let parent = start(SandboxConfigBuilder::default()).await;
     let child = start(SandboxConfigBuilder::default().parent(parent.handle())).await;
 
+    // Advance `parent`'s PID counter past `child`'s small namespace PIDs so
+    // `parent_pid_in_parent` cannot coincide numerically with `child_proc`'s
+    // own PID inside `child`.
+    for _ in 0..5 {
+        let _ = sh(&parent, ":").await;
+    }
+
     let mut parent_proc = parent
         .command("/bin/sh")
         .arg("-c")
@@ -211,6 +218,11 @@ async fn nested_linux_container_allows_parent_to_child_signals_denies_reverse_an
 
     let parent_pid_in_parent = parent_proc.sandbox_id();
     let child_host_pid = child_proc.id();
+    assert!(
+        parent_pid_in_parent > child_proc.sandbox_id() + 2,
+        "parent_pid_in_parent={parent_pid_in_parent}, child_sandbox_pid={}",
+        child_proc.sandbox_id()
+    );
     assert_eq!(
         child.pid_in_sandbox(parent_proc.id()),
         None,
