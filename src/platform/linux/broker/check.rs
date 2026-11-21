@@ -230,21 +230,6 @@ impl Guard {
         Ok(guard)
     }
 
-    /// Record an additional writable path granted dynamically at runtime.
-    pub(crate) fn add_writable_path(&mut self, path: &Path) {
-        let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-        let dest = if is_dir {
-            &mut self.writable_dirs
-        } else {
-            &mut self.writable_files
-        };
-        for alias in with_aliases(path, &self.mounts) {
-            if !dest.contains(&alias) {
-                dest.push(alias);
-            }
-        }
-    }
-
     /// Whether `path` may have its contents or metadata written under the
     /// positive sandbox policy.
     pub(crate) fn can_write(&self, path: &Path) -> bool {

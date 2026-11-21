@@ -16,9 +16,10 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::ops::Deref;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::check::Guard;
@@ -34,16 +35,30 @@ use super::table;
 /// The most threads that serve one sandbox, however many calls block.
 const MAX_WORKERS: usize = 256;
 
-/// What every thread that serves a sandbox shares.
+/// Resources shared by every command tree inside one sandbox.
 #[derive(Debug)]
-pub(crate) struct Shared {
-    guard: Arc<RwLock<Guard>>,
+pub(crate) struct Home {
     pub(super) pool: Option<Pool>,
     pub(super) sink: Arc<DenialSink>,
     rename_lock: RwLock<()>,
     proxy_port: Option<u16>,
-    sync_wake_up: bool,
+    pub(super) sync_wake_up: bool,
     diagnostics: Outbox,
+}
+
+/// Per-command policy snapshot paired with the sandbox's shared [`Home`].
+#[derive(Debug)]
+pub(crate) struct Shared {
+    guard: Arc<Guard>,
+    home: Arc<Home>,
+}
+
+impl Deref for Shared {
+    type Target = Home;
+
+    fn deref(&self) -> &Self::Target {
+        &self.home
+    }
 }
 
 /// The lock a call holds while it is served.
@@ -57,15 +72,13 @@ pub(crate) enum Held<'a> {
 }
 
 impl Shared {
-    /// Read access to the policy guard.
-    pub(crate) fn guard(&self) -> RwLockReadGuard<'_, Guard> {
-        self.guard.read().unwrap_or_else(PoisonError::into_inner)
+    /// Launch-time policy guard for this command tree.
+    pub(crate) fn guard(&self) -> &Guard {
+        &self.guard
     }
 
     /// Lock for serving `syscall`.
     pub(crate) fn hold_for(&self, syscall: Syscall) -> Held<'_> {
-        // A connect to an inet address names no file and can take long, so it
-        // must not hold up the renames that wait for the write side.
         if syscall == Syscall::Connect {
             return Held::None;
         }
@@ -74,13 +87,15 @@ impl Shared {
             Syscall::Rename | Syscall::Renameat | Syscall::Renameat2
         ) {
             Held::Exclusive(
-                self.rename_lock
+                self.home
+                    .rename_lock
                     .write()
                     .unwrap_or_else(PoisonError::into_inner),
             )
         } else {
             Held::Shared(
-                self.rename_lock
+                self.home
+                    .rename_lock
                     .read()
                     .unwrap_or_else(PoisonError::into_inner),
             )
@@ -94,12 +109,12 @@ impl Shared {
 
     /// Whether a connection to `ip:port` is the one the sandbox may make.
     pub(crate) fn proxy_reachable(&self, ip: Ipv4Addr, port: u16) -> bool {
-        ip == crate::network::PROXY_ADDRESS && self.proxy_port == Some(port)
+        ip == crate::network::PROXY_ADDRESS && self.home.proxy_port == Some(port)
     }
 
     /// Hand a diagnostic to the thread that emits them. Never waits.
     pub(crate) fn say(&self, diagnostic: Diagnostic) {
-        self.diagnostics.say(diagnostic);
+        self.home.diagnostics.say(diagnostic);
     }
 }
 
@@ -224,20 +239,32 @@ fn serve(serving: &Arc<Serving>, notification: &libc::seccomp_notif) {
     }
 }
 
+/// Commands sent from the launcher to the home thread alongside socket fds.
+pub(super) enum HomeCommand {
+    Adopt {
+        guard: Arc<Guard>,
+    },
+    GrantPool {
+        ruleset: crate::platform::linux::landlock_rules::PreparedRuleset,
+        reply:
+            Sender<crate::error::Result<crate::platform::linux::landlock_rules::PreparedRuleset>>,
+    },
+}
+
 /// What the home thread builds what it shares from.
 pub(super) struct Setup {
-    pub(super) guard: Arc<RwLock<Guard>>,
     pub(super) pool: Option<PoolPlan>,
     pub(super) sink: Arc<DenialSink>,
     pub(super) proxy_port: Option<u16>,
     pub(super) sync_wake_up: bool,
     pub(super) diagnostics: Outbox,
+    pub(super) commands: Receiver<HomeCommand>,
 }
 
 /// Build what the workers share, from the pool's plan and the pool's
 /// descriptors, which arrive first.
-fn build(socket: &OwnedFd, setup: Setup) -> io::Result<Arc<Shared>> {
-    let pool = match setup.pool {
+fn build(socket: &OwnedFd, setup: &mut Setup) -> io::Result<Arc<Home>> {
+    let pool = match setup.pool.take() {
         Some(plan) => {
             let held = table::recv_fds(socket.as_fd())?.ok_or_else(|| {
                 io::Error::other("the launcher ended before it sent the inode pool's directories")
@@ -249,28 +276,36 @@ fn build(socket: &OwnedFd, setup: Setup) -> io::Result<Arc<Shared>> {
         }
         None => None,
     };
-    Ok(Arc::new(Shared {
-        guard: setup.guard,
+    Ok(Arc::new(Home {
         pool,
-        sink: setup.sink,
+        sink: Arc::clone(&setup.sink),
         rename_lock: RwLock::new(()),
         proxy_port: setup.proxy_port,
         sync_wake_up: setup.sync_wake_up,
-        diagnostics: setup.diagnostics,
+        diagnostics: setup.diagnostics.clone(),
     }))
 }
 
 /// Start serving the listener a sandboxed process sent.
-fn adopt(shared: &Arc<Shared>, listener: Vec<OwnedFd>, workers: usize) -> io::Result<()> {
+fn adopt(
+    home: &Arc<Home>,
+    guard: Arc<Guard>,
+    listener: Vec<OwnedFd>,
+    workers: usize,
+) -> io::Result<()> {
     let [listener] = <[OwnedFd; 1]>::try_from(listener)
         .map_err(|_| io::Error::other("a message carried more than one listener"))?;
     let listener = Listener::new(listener);
-    if shared.sync_wake_up {
+    if home.sync_wake_up {
         listener.set_sync_wake_up()?;
     }
+    let shared = Arc::new(Shared {
+        guard,
+        home: Arc::clone(home),
+    });
     let serving = Arc::new(Serving {
         listener,
-        shared: Arc::clone(shared),
+        shared,
         idle: AtomicUsize::new(0),
         threads: AtomicUsize::new(0),
         base: workers,
@@ -283,12 +318,9 @@ fn adopt(shared: &Arc<Shared>, listener: Vec<OwnedFd>, workers: usize) -> io::Re
 
 /// The home thread: build the shared state, say so, then serve every listener
 /// the launcher sends until its end of the socket closes.
-///
-/// Each result goes to `acknowledge` in order: the first for the setup, then
-/// one for each listener.
-pub(super) fn run(socket: &OwnedFd, setup: Setup, acknowledge: &Sender<io::Result<()>>) {
-    let shared = match build(socket, setup) {
-        Ok(shared) => shared,
+pub(super) fn run(socket: &OwnedFd, mut setup: Setup, acknowledge: &Sender<io::Result<()>>) {
+    let home = match build(socket, &mut setup) {
+        Ok(home) => home,
         Err(error) => {
             let _ = acknowledge.send(Err(error));
             return;
@@ -296,15 +328,35 @@ pub(super) fn run(socket: &OwnedFd, setup: Setup, acknowledge: &Sender<io::Resul
     };
     let _ = acknowledge.send(Ok(()));
     let workers = std::thread::available_parallelism().map_or(2, usize::from);
-    loop {
-        match table::recv_fds(socket.as_fd()) {
-            Ok(Some(listener)) => {
-                let _ = acknowledge.send(adopt(&shared, listener, workers));
-            }
-            Ok(None) => return,
-            Err(error) => {
-                let _ = acknowledge.send(Err(error));
-                return;
+    let abi = crate::platform::linux::landlock_rules::REQUIRED_ABI;
+    let reads = crate::platform::linux::landlock_rules::read_rights(abi);
+    while let Ok(command) = setup.commands.recv() {
+        match command {
+            HomeCommand::Adopt { guard } => match table::recv_fds(socket.as_fd()) {
+                Ok(Some(listener)) => {
+                    let _ = acknowledge.send(adopt(&home, guard, listener, workers));
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    let _ = acknowledge.send(Err(error));
+                    return;
+                }
+            },
+            HomeCommand::GrantPool { mut ruleset, reply } => {
+                let res = match &home.pool {
+                    Some(pool) => pool
+                        .grant_remaining(&mut |fd, access| {
+                            let access = access & reads;
+                            if access.is_empty() {
+                                Ok(())
+                            } else {
+                                ruleset.add_inode(fd, access, abi)
+                            }
+                        })
+                        .map(|()| ruleset),
+                    None => Ok(ruleset),
+                };
+                let _ = reply.send(res);
             }
         }
     }

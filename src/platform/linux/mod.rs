@@ -22,6 +22,11 @@ use crate::resolve::ResolvedPath;
 const MIN_KERNEL_VERSION: KernelVersion = KernelVersion::new(6, 7, 0);
 
 struct LiveRules {
+    /// Internal sandbox grants (runner executable, supervisor binary, IPC shims).
+    internal_grants: Vec<Grant>,
+    /// Base read denylist supplied at sandbox construction.
+    base_read_denylist: Option<crate::policy::ReadDenylist>,
+    proxy_port: Option<u16>,
     config: SandboxConfigData,
     ruleset: landlock_rules::PreparedRuleset,
 }
@@ -113,9 +118,21 @@ impl LinuxBackend {
 
         let runner = Runner::start_linux(config.parent())?;
         let mut config = config.clone();
+        let mut internal_grants = Vec::new();
         if let Some(exec_path) = runner.runner_executable() {
-            config.push_grant(ResolvedPath::new(exec_path)?, Access::EXEC);
+            let resolved = ResolvedPath::new(exec_path)?;
+            internal_grants.push(Grant::new(resolved.clone(), Access::EXEC));
+            config.push_grant(resolved, Access::EXEC);
         }
+        if let Some(sup_bin) = config.supervisor_binary() {
+            let resolved = ResolvedPath::new(sup_bin)?;
+            internal_grants.push(Grant::new(resolved, Access::EXEC));
+        }
+        if let Some(ipc_bin) = config.ipc_bin_dir() {
+            let resolved = ResolvedPath::new(ipc_bin)?;
+            internal_grants.push(Grant::new(resolved, Access::EXEC));
+        }
+        let base_read_denylist = config.read_denylist().cloned();
 
         let (broker, mut ruleset) =
             match broker::Broker::new(&config, proxy_port, Arc::clone(&sink))? {
@@ -133,7 +150,13 @@ impl LinuxBackend {
         Ok(Self {
             runner: Some(runner),
             broker,
-            live: Some(RwLock::new(LiveRules { config, ruleset })),
+            live: Some(RwLock::new(LiveRules {
+                internal_grants,
+                base_read_denylist,
+                proxy_port,
+                config,
+                ruleset,
+            })),
             seccomp_filters,
             sink,
         })
@@ -179,28 +202,74 @@ impl LinuxBackend {
         let mut guard = live
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut new_writable = Vec::new();
         for grant in grants {
             crate::platform::unresolved::verify(grant.path())?;
-            if grant.access().can_write() {
-                new_writable.push(grant.path());
-            }
             guard
                 .config
                 .push_grant(grant.resolved_path().clone(), grant.access());
         }
-        let LiveRules {
-            ref config,
-            ref mut ruleset,
-        } = *guard;
-        match &self.broker {
-            Some(broker) => broker.extend_ruleset(ruleset, config, &new_writable)?,
-            None => {
-                let plan = landlock_rules::plan(config);
-                ruleset.add_planned(&plan, landlock_rules::REQUIRED_ABI)?;
-            }
-        }
+        let ruleset = self.build_live_ruleset(&guard.config, guard.proxy_port)?;
+        guard.ruleset = ruleset;
         Ok(())
+    }
+
+    /// Synchronize the live sandbox's grants and extra read denials to match
+    /// `grants` and `read_denied` for subsequent commands, leaving commands
+    /// already running on the ruleset and broker guard they launched with.
+    pub(crate) fn set_grants(&self, grants: &[Grant], read_denied: &[ResolvedPath]) -> Result<()> {
+        let Some(live) = &self.live else {
+            return Ok(());
+        };
+        for grant in grants {
+            crate::platform::unresolved::verify(grant.path())?;
+        }
+        for denied in read_denied {
+            crate::platform::unresolved::verify(denied.as_path())?;
+        }
+        let mut guard = live
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let merged_grants = guard
+            .internal_grants
+            .iter()
+            .cloned()
+            .chain(grants.iter().cloned())
+            .collect::<Vec<_>>();
+        guard.config.replace_grants(merged_grants);
+
+        let merged_denylist = if read_denied.is_empty() {
+            guard.base_read_denylist.clone()
+        } else {
+            let mut list = guard
+                .base_read_denylist
+                .clone()
+                .unwrap_or_else(crate::policy::ReadDenylist::credentials);
+            for path in read_denied {
+                list = list.deny(path.as_path());
+            }
+            Some(list)
+        };
+        guard.config.set_read_denylist(merged_denylist);
+
+        let ruleset = self.build_live_ruleset(&guard.config, guard.proxy_port)?;
+        guard.ruleset = ruleset;
+        Ok(())
+    }
+
+    fn build_live_ruleset(
+        &self,
+        config: &SandboxConfigData,
+        proxy_port: Option<u16>,
+    ) -> Result<landlock_rules::PreparedRuleset> {
+        let mut ruleset = match &self.broker {
+            Some(broker) => broker.rebuild_policy(config, proxy_port)?,
+            None => landlock_rules::build_ruleset(config, proxy_port)?,
+        };
+        if let Some(proc_fd) = self.runner.as_deref().and_then(Runner::proc_fd) {
+            let proc_writable = config.writable_file_system() && self.broker.is_none();
+            ruleset.grant_private_proc(proc_fd, proc_writable)?;
+        }
+        Ok(ruleset)
     }
 
     /// Shut down the persistent namespace container, triggering kernel
@@ -266,7 +335,7 @@ impl LinuxBackend {
                         Some((broker, parent_sock)),
                     )
                 }
-                None => (&[][..], None, None),
+                None => (Vec::new(), None, None),
             };
 
             let child = runner.spawn_command(
@@ -282,7 +351,7 @@ impl LinuxBackend {
                 io_policy,
                 LinuxSpawnExtra {
                     ruleset: Some(ruleset_fd.as_fd()),
-                    notif_filter,
+                    notif_filter: &notif_filter,
                     seccomp_filters: &self.seccomp_filters,
                     broker_child_sock,
                     broker_handoff,

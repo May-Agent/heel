@@ -55,6 +55,7 @@ pub(crate) type Grant<'a> = dyn FnMut(BorrowedFd<'_>, BitFlags<AccessFs>) -> Res
 struct Group {
     directory: PathBuf,
     held: OwnedFd,
+    rights: BitFlags<AccessFs>,
     members: Vec<PathBuf>,
     files: Mutex<Vec<String>>,
     directories: Mutex<Vec<String>>,
@@ -321,6 +322,7 @@ impl Pool {
             .map(|(group, held)| Group {
                 directory: group.directory,
                 held,
+                rights: group.rights,
                 members: group.members,
                 files: Mutex::new(group.files),
                 directories: Mutex::new(group.directories),
@@ -330,6 +332,29 @@ impl Pool {
             groups,
             capacity: plan.capacity,
         })
+    }
+
+    /// Add Landlock rules for all remaining unconsumed pool entries through
+    /// `grant`, running inside the serving thread's descriptor table.
+    pub(crate) fn grant_remaining(&self, grant: &mut Grant<'_>) -> Result<()> {
+        for group in &self.groups {
+            let files = group
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let directories = group
+                .directories
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            for name in files.iter().chain(&directories) {
+                if let Ok(entry) = open_entry(&group.held, name, &group.directory) {
+                    grant(entry.as_fd(), group.rights)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Take an inode of `kind` for a new entry in `directory`.

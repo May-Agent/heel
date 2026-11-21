@@ -287,3 +287,101 @@ async fn nested_linux_container_allows_parent_to_child_signals_denies_reverse_an
     drop(grandchild);
     drop(child);
 }
+
+#[tokio::test]
+async fn set_grants_revokes_previous_grants_and_applies_dynamic_read_denials() {
+    let dir = fixtures::tempdir();
+    let dir_path = std::fs::canonicalize(dir.path()).unwrap();
+    let secret_dir = fixtures::tempdir();
+    let secret_path = std::fs::canonicalize(secret_dir.path()).unwrap();
+    std::fs::write(secret_path.join("secret.txt"), "classified\n").unwrap();
+
+    let sandbox = start(
+        SandboxConfigBuilder::default()
+            .filesystem_strict(false)
+            .writable(fixtures::resolved(&dir_path)),
+    )
+    .await;
+
+    let write_first = sh(
+        &sandbox,
+        &format!("touch '{}'", dir_path.join("first").display()),
+    )
+    .await;
+    assert!(write_first.status.success(), "{}", stderr(&write_first));
+    let read_before = sh(
+        &sandbox,
+        &format!("cat '{}'", secret_path.join("secret.txt").display()),
+    )
+    .await;
+    assert!(read_before.status.success(), "{}", stderr(&read_before));
+
+    sandbox
+        .set_grants([], [fixtures::resolved(&secret_path)])
+        .await
+        .expect("set_grants revokes writable dir and adds read denial");
+
+    let write_after = sh(
+        &sandbox,
+        &format!("touch '{}'", dir_path.join("after_revoke").display()),
+    )
+    .await;
+    assert!(
+        !write_after.status.success(),
+        "revoked writable grant must no longer permit writes"
+    );
+    assert!(!dir_path.join("after_revoke").exists());
+
+    let read_after = sh(
+        &sandbox,
+        &format!("cat '{}'", secret_path.join("secret.txt").display()),
+    )
+    .await;
+    assert!(
+        !read_after.status.success(),
+        "dynamic read denial must block reading denied subtree"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn running_linux_command_keeps_launch_grants_across_set_grants() {
+    use heel::{Access, Grant};
+
+    let dir = fixtures::tempdir();
+    let dir_path = std::fs::canonicalize(dir.path()).unwrap();
+    let early_file = dir_path.join("early.txt");
+    let fresh_file = dir_path.join("fresh.txt");
+
+    let sandbox = start(SandboxConfigBuilder::default().filesystem_strict(false)).await;
+
+    let mut running = sandbox
+        .command("/bin/sh")
+        .arg("-c")
+        .arg(format!("sleep 0.6; touch '{}'", early_file.display()))
+        .spawn()
+        .await
+        .expect("spawns early command");
+
+    sandbox
+        .set_grants(
+            [Grant::new(
+                fixtures::resolved(&dir_path),
+                Access::WRITE | Access::EXEC,
+            )],
+            [],
+        )
+        .await
+        .expect("grants dir to subsequent commands");
+
+    let fresh = sh(&sandbox, &format!("touch '{}'", fresh_file.display())).await;
+    assert!(fresh.status.success(), "{}", stderr(&fresh));
+    assert!(fresh_file.exists());
+
+    let status = running.wait().await.expect("waits for early command");
+    assert!(
+        !status.success(),
+        "command launched before set_grants must keep its launch-time ruleset and guard"
+    );
+    assert!(!early_file.exists());
+}

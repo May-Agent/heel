@@ -48,18 +48,6 @@ impl PreparedRuleset {
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EPERM))
     }
 
-    /// Append additional planned rules to this live ruleset.
-    pub(crate) fn add_planned(&mut self, rules: &[Planned], abi: ABI) -> Result<()> {
-        for rule in rules {
-            if rule.required {
-                add_required_path(&mut self.inner, &rule.path, rule.access, abi)?;
-            } else {
-                add_system_path(&mut self.inner, &rule.path, rule.access, abi)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Add a rule for the container's private `/proc` mount root inode.
     pub(crate) fn grant_private_proc(
         &mut self,
@@ -132,7 +120,23 @@ pub(crate) fn build_ruleset(
     config: &SandboxConfigData,
     proxy_port: Option<u16>,
 ) -> Result<PreparedRuleset> {
-    let ruleset = instantiate(&plan(config), proxy_port, REQUIRED_ABI)?;
+    let planned = plan(config);
+    let rules = match config.read_denylist() {
+        Some(read) => {
+            let (carved, _ours) = crate::platform::linux::broker::on_the_setup_thread(|_socket| {
+                let resolved = read.resolve()?;
+                let denied: Vec<PathBuf> = resolved
+                    .trees
+                    .into_iter()
+                    .filter(|tree| !resolved.sockets.contains(tree))
+                    .collect();
+                carve(planned, &denied, REQUIRED_ABI)
+            })?;
+            carved?.rules
+        }
+        None => planned,
+    };
+    let ruleset = instantiate(&rules, proxy_port, REQUIRED_ABI)?;
 
     tracing::debug!(
         proxy_port,
