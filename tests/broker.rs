@@ -895,6 +895,16 @@ mod locks {
             }
         }
 
+        fn read_proc_locks() -> String {
+            use std::io::Read as _;
+            let mut text = String::with_capacity(64 * 1024);
+            std::fs::File::open("/proc/locks")
+                .unwrap()
+                .read_to_string(&mut text)
+                .unwrap();
+            text
+        }
+
         /// The line of `/proc/locks` that lists this lock, if there is one.
         fn listed(&self) -> Option<String> {
             let (kind, mode, owned_by_process) = self.lock.listing();
@@ -903,8 +913,7 @@ mod locks {
             } else {
                 "-1".to_owned()
             };
-            std::fs::read_to_string("/proc/locks")
-                .unwrap()
+            Self::read_proc_locks()
                 .lines()
                 .find(|line| {
                     let fields: Vec<&str> = line.split_whitespace().collect();
@@ -947,7 +956,7 @@ mod locks {
                     self.lock,
                     self.path.display(),
                     self.inode,
-                    std::fs::read_to_string("/proc/locks").unwrap()
+                    Self::read_proc_locks()
                 ));
             };
             if !self.conflicts_for_another_process() {

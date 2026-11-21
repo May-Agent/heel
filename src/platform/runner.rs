@@ -30,7 +30,7 @@ const RUNNER_EXECUTABLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heel-
 const OP_SPAWN: u8 = 1;
 const OP_KILL: u8 = 2;
 #[cfg(target_os = "macos")]
-const OP_GRANT: u8 = 3;
+const OP_SYNC_EXTENSIONS: u8 = 3;
 #[cfg(target_os = "linux")]
 const OP_SPAWN_CHILD_RUNNER: u8 = 4;
 
@@ -472,28 +472,38 @@ impl Runner {
         send_with_fds(writer.as_raw_fd(), &len_bytes, payload, fds)
     }
 
-    /// Consume dynamic Seatbelt extension tokens inside the persistent macOS runner.
+    /// Release `release_keys` and consume `add_entries` `(key, token)` inside
+    /// the persistent macOS runner.
     #[cfg(target_os = "macos")]
-    pub(crate) fn consume_extensions(&self, tokens: &[String]) -> Result<()> {
-        if tokens.is_empty() {
+    pub(crate) fn sync_extensions(
+        &self,
+        release_keys: &[String],
+        add_entries: &[(String, String)],
+    ) -> Result<()> {
+        if release_keys.is_empty() && add_entries.is_empty() {
             return Ok(());
         }
         let req_id = self.alloc_id();
         let mut buf = Vec::new();
-        buf.push(OP_GRANT);
+        buf.push(OP_SYNC_EXTENSIONS);
         buf.extend_from_slice(&req_id.to_le_bytes());
-        buf.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
-        for token in tokens {
+        buf.extend_from_slice(&(release_keys.len() as u32).to_le_bytes());
+        for key in release_keys {
+            push_str(&mut buf, key);
+        }
+        buf.extend_from_slice(&(add_entries.len() as u32).to_le_bytes());
+        for (key, token) in add_entries {
+            push_str(&mut buf, key);
             push_str(&mut buf, token);
         }
         self.send_packet(&buf, &[])?;
         match self.mailbox.wait_reply(req_id)? {
             Reply::Ack => Ok(()),
             Reply::Err(msg) => Err(Error::InitFailed(format!(
-                "consuming macOS sandbox extension failed: {msg}"
+                "synchronizing macOS sandbox extensions failed: {msg}"
             ))),
             other => Err(Error::InitFailed(format!(
-                "unexpected reply to OP_GRANT: {other:?}"
+                "unexpected reply to OP_SYNC_EXTENSIONS: {other:?}"
             ))),
         }
     }
@@ -512,7 +522,6 @@ impl Runner {
         limits: &[(i32, u64)],
         nice: Option<i32>,
         io_policy: Option<i32>,
-        #[cfg(target_os = "macos")] extra_tokens: &[String],
         #[cfg(target_os = "linux")] linux_extra: LinuxSpawnExtra<'_>,
     ) -> io::Result<RunnerChild> {
         let (stdin_mode, host_stdin, child_stdin) = prepare_stdio(stdin_cfg, 0)?;
@@ -554,14 +563,6 @@ impl Runner {
         }
         if let Some(fd) = &child_stderr {
             fds_to_send.push(fd.as_raw_fd());
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            buf.extend_from_slice(&(extra_tokens.len() as u32).to_le_bytes());
-            for tok in extra_tokens {
-                push_str(&mut buf, tok);
-            }
         }
 
         #[cfg(target_os = "linux")]
@@ -1230,6 +1231,26 @@ fn read_linux_handshake(sock: &UnixStream) -> io::Result<(u32, OwnedFd)> {
 /// Issue a macOS Seatbelt file extension token for `grant`.
 #[cfg(target_os = "macos")]
 pub(crate) fn issue_macos_extension(grant: &Grant) -> Result<String> {
+    crate::platform::unresolved::verify(grant.path())?;
+    let access = grant.access();
+    let class = match (access.can_write(), access.can_execute()) {
+        (true, true) => c"heel.grant.write-exec",
+        (true, false) => c"heel.grant.write",
+        (false, true) => c"heel.grant.exec",
+        (false, false) => c"heel.grant.read",
+    };
+    issue_macos_extension_for_class(class, grant.path())
+}
+
+/// Issue a macOS Seatbelt read-denial extension token (`heel.deny.read`) for `path`.
+#[cfg(target_os = "macos")]
+pub(crate) fn issue_macos_deny_read(path: &Path) -> Result<String> {
+    crate::platform::unresolved::verify(path)?;
+    issue_macos_extension_for_class(c"heel.deny.read", path)
+}
+
+#[cfg(target_os = "macos")]
+fn issue_macos_extension_for_class(class: &std::ffi::CStr, path: &Path) -> Result<String> {
     use std::ffi::{CStr, CString, c_char};
     use std::os::unix::ffi::OsStrExt;
 
@@ -1241,25 +1262,17 @@ pub(crate) fn issue_macos_extension(grant: &Grant) -> Result<String> {
         ) -> *mut c_char;
     }
 
-    crate::platform::unresolved::verify(grant.path())?;
-    let access = grant.access();
-    let class = match (access.can_write(), access.can_execute()) {
-        (true, true) => c"heel.grant.write-exec",
-        (true, false) => c"heel.grant.write",
-        (false, true) => c"heel.grant.exec",
-        (false, false) => c"heel.grant.read",
-    };
-    let c_path = CString::new(grant.path().as_os_str().as_bytes()).map_err(|_| {
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         Error::InvalidProfile(format!(
             "granted path contains an interior NUL byte: {}",
-            grant.path().display()
+            path.display()
         ))
     })?;
     // SAFETY: `class` and `c_path` are valid NUL-terminated C strings; the
     // returned buffer is allocated with `malloc` by `libSystem` and freed below.
     let raw = unsafe { sandbox_extension_issue_file(class.as_ptr(), c_path.as_ptr(), 0) };
     if raw.is_null() {
-        return Err(Error::path(grant.path(), io::Error::last_os_error()));
+        return Err(Error::path(path, io::Error::last_os_error()));
     }
     // SAFETY: `raw` is a non-null NUL-terminated string allocated by `libSystem`.
     let token = unsafe { CStr::from_ptr(raw).to_string_lossy().into_owned() };

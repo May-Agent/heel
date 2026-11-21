@@ -5,17 +5,21 @@ mod profile;
 
 pub use profile::generate_profile;
 
+use std::collections::BTreeSet;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::grant::Grant;
 use crate::platform::child::unix::UnixChild;
 use crate::platform::preexec::PreExecSetup;
-use crate::platform::runner::{Runner, SandboxHandle, StagedRunner, issue_macos_extension};
+use crate::platform::runner::{
+    Runner, SandboxHandle, StagedRunner, issue_macos_deny_read, issue_macos_extension,
+};
 use crate::platform::{Backend, Child, SpawnRequest};
+use crate::resolve::ResolvedPath;
 
 /// Absolute path to the system sandbox launcher.
 ///
@@ -29,9 +33,23 @@ pub struct MacOSBackend {
     profile: String,
     /// Persistent in-sandbox runner for confined sandboxes (`None` under `host_access`).
     runner: Option<Arc<Runner>>,
-    /// Live Seatbelt extension tokens issued through [`Sandbox::grant`], also
-    /// applied in each child's `pre_exec` so they survive `execve`.
-    live_tokens: std::sync::Mutex<Vec<String>>,
+    /// Keys of Seatbelt extensions currently active inside `runner`.
+    active_keys: Mutex<BTreeSet<String>>,
+}
+
+fn grant_extension_key(grant: &Grant) -> String {
+    let a = grant.access();
+    let tag = match (a.can_write(), a.can_execute()) {
+        (true, true) => "wx",
+        (true, false) => "w",
+        (false, true) => "x",
+        (false, false) => "r",
+    };
+    format!("g:{tag}:{}", grant.path().display())
+}
+
+fn deny_extension_key(path: &ResolvedPath) -> String {
+    format!("d:{}", path.as_path().display())
 }
 
 impl MacOSBackend {
@@ -52,7 +70,7 @@ impl MacOSBackend {
             return Ok(Self {
                 profile,
                 runner: None,
-                live_tokens: std::sync::Mutex::new(Vec::new()),
+                active_keys: Mutex::new(BTreeSet::new()),
             });
         }
 
@@ -61,11 +79,15 @@ impl MacOSBackend {
             profile::generate_profile_with_runner(config, proxy_port, Some(staged.path()))?;
         let setup = PreExecSetup::new(config)?;
         let runner = Runner::start_macos(staged, &profile, setup)?;
-        Ok(Self {
+        let backend = Self {
             profile,
             runner: Some(runner),
-            live_tokens: std::sync::Mutex::new(Vec::new()),
-        })
+            active_keys: Mutex::new(BTreeSet::new()),
+        };
+        if !config.filesystem_strict() && !config.grants().is_empty() {
+            backend.set_grants(config.grants(), &[])?;
+        }
+        Ok(backend)
     }
 
     /// Handle to this sandbox's runner.
@@ -78,15 +100,52 @@ impl MacOSBackend {
         let Some(runner) = &self.runner else {
             return Ok(());
         };
-        let tokens = grants
-            .iter()
-            .map(issue_macos_extension)
-            .collect::<Result<Vec<_>>>()?;
-        runner.consume_extensions(&tokens)?;
-        self.live_tokens
+        let mut active = self
+            .active_keys
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(tokens);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut to_add = Vec::new();
+        for grant in grants {
+            let key = grant_extension_key(grant);
+            if !active.contains(&key) {
+                to_add.push((key, issue_macos_extension(grant)?));
+            }
+        }
+        runner.sync_extensions(&[], &to_add)?;
+        for (key, _) in to_add {
+            active.insert(key);
+        }
+        Ok(())
+    }
+
+    /// Synchronize the live sandbox's grants and extra read denials to match
+    /// `grants` and `read_denied`, releasing any revoked Seatbelt extensions.
+    pub(crate) fn set_grants(&self, grants: &[Grant], read_denied: &[ResolvedPath]) -> Result<()> {
+        let Some(runner) = &self.runner else {
+            return Ok(());
+        };
+        let mut active = self
+            .active_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut desired = BTreeSet::new();
+        let mut to_add = Vec::new();
+        for grant in grants {
+            let key = grant_extension_key(grant);
+            if desired.insert(key.clone()) && !active.contains(&key) {
+                to_add.push((key, issue_macos_extension(grant)?));
+            }
+        }
+        for denied in read_denied {
+            let key = deny_extension_key(denied);
+            if desired.insert(key.clone()) && !active.contains(&key) {
+                to_add.push((key, issue_macos_deny_read(denied.as_path())?));
+            }
+        }
+        let to_release: Vec<String> = active.difference(&desired).cloned().collect();
+        runner.sync_extensions(&to_release, &to_add)?;
+        *active = desired;
         Ok(())
     }
 
@@ -159,11 +218,6 @@ impl MacOSBackend {
             let envs = merged_envs(request.config, request.envs);
             // Resource limits and scheduling priority were installed on the
             // persistent runner before `sandbox-exec` and are inherited across `fork`.
-            let extra_tokens = self
-                .live_tokens
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
             let child = runner.spawn_command(
                 request.program,
                 request.args,
@@ -175,7 +229,6 @@ impl MacOSBackend {
                 &[],
                 None,
                 None,
-                &extra_tokens,
             )?;
             return Ok(Child::new(UnixChild::from_runner(child)));
         }

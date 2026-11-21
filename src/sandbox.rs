@@ -498,12 +498,37 @@ impl<N: NetworkPolicy> Sandbox<N> {
     /// persistent in-sandbox runner. On Linux, updates the Landlock ruleset and
     /// broker allowlist applied to subsequent commands in the container.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[allow(clippy::unused_async)]
     pub async fn grant(&self, grants: impl IntoIterator<Item = crate::grant::Grant>) -> Result<()> {
         let grants: Vec<crate::grant::Grant> = grants.into_iter().collect();
         if grants.is_empty() {
             return Ok(());
         }
         self.backend.grant(&grants)
+    }
+
+    /// Synchronize the live sandbox's user grants and extra read denials.
+    ///
+    /// Any previously granted user path omitted from `grants` is revoked:
+    /// released via `sandbox_extension_release` on macOS, and excluded from the
+    /// Landlock ruleset and broker guard of subsequent commands on Linux.
+    /// Paths in `read_denied` are denied for reads (and writes) in addition to
+    /// the sandbox's base [`ReadDenylist`](crate::ReadDenylist).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[allow(clippy::unused_async)]
+    pub async fn set_grants(
+        &self,
+        grants: impl IntoIterator<Item = crate::grant::Grant>,
+        read_denied: impl IntoIterator<Item = crate::resolve::ResolvedPath>,
+    ) -> Result<()> {
+        let mut merged: Vec<crate::grant::Grant> = self
+            .config_data
+            .identity()
+            .map(|id| id.persistent_grants().to_vec())
+            .unwrap_or_default();
+        merged.extend(grants);
+        let read_denied: Vec<crate::resolve::ResolvedPath> = read_denied.into_iter().collect();
+        self.backend.set_grants(&merged, &read_denied)
     }
 
     /// Translate a PID observed inside this sandbox into its host PID, if the

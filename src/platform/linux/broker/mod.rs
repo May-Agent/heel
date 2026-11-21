@@ -77,18 +77,23 @@ pub(crate) use filter::x32_refusal;
 /// A seccomp listener socket handed to the launcher thread.
 struct AcceptJob {
     listener_socket: OwnedFd,
+    guard: Arc<Guard>,
     reply: SyncSender<io::Result<()>>,
 }
 
 /// The broker of one sandbox.
 pub(crate) struct Broker {
-    program_bytes: Vec<u8>,
+    program_bytes: RwLock<Vec<u8>>,
     /// Dropping the broker drops this, which ends the launcher, which closes its
     /// end of the home thread's socket and so ends the home thread.
     jobs: Sender<AcceptJob>,
-    /// Shared only for pure-memory policy updates (`Guard` holds no `OwnedFd`).
-    guard: Arc<RwLock<Guard>>,
-    carve_denied: Option<Vec<PathBuf>>,
+    /// Commands sent directly to `home` (e.g. granting remaining pool inodes).
+    home_commands: Sender<home::HomeCommand>,
+    /// Current policy guard snapshot cloned into each newly spawned command.
+    guard: RwLock<Arc<Guard>>,
+    /// Directories holding pre-created inode pools, preserved across policy updates.
+    pool_dirs: Vec<PathBuf>,
+    denylists: bool,
 }
 
 /// `/proc/sys/kernel/yama/ptrace_scope`, when Yama is loaded.
@@ -192,7 +197,9 @@ fn init(what: &'static str) -> impl FnOnce(io::Error) -> Error {
 
 /// Run `body` on the setup thread, which has a descriptor table of its own, with
 /// the thread's end of a socket, and return what it returned with the other end.
-fn on_the_setup_thread<R: Send>(body: impl FnOnce(&OwnedFd) -> R + Send) -> Result<(R, OwnedFd)> {
+pub(crate) fn on_the_setup_thread<R: Send>(
+    body: impl FnOnce(&OwnedFd) -> R + Send,
+) -> Result<(R, OwnedFd)> {
     let (ours, theirs) = table::socket_pair().map_err(init("cannot make the setup socket"))?;
     let done = std::thread::scope(|scope| {
         let setup = table::spawn_scoped(scope, "heel-broker-setup", theirs, |socket| body(&socket))
@@ -245,7 +252,7 @@ impl Broker {
         check_ptrace_scope()?;
 
         let abi = REQUIRED_ABI;
-        let (sandbox_ruleset, guard, pool, held, carve_denied, coverage) = if denylists {
+        let (sandbox_ruleset, guard, pool, pool_dirs, held, coverage) = if denylists {
             let plan = landlock_rules::plan(config);
             let (prepared, held) = prepare_on_a_thread(config, &plan, abi)?;
             let Prepared {
@@ -253,6 +260,7 @@ impl Broker {
                 guard,
                 pool,
             } = prepared;
+            let pool_dirs = pool.as_ref().map_or_else(Vec::new, PoolPlan::directories);
             let sandbox_rules = without_writes(&carved.rules, abi);
             let mut sandbox_ruleset = landlock_rules::instantiate(&sandbox_rules, proxy_port, abi)?;
             let reads = landlock_rules::read_rights(abi);
@@ -266,25 +274,12 @@ impl Broker {
                     }
                 })?;
             }
-            let denied = match config.read_denylist() {
-                Some(read) => {
-                    let resolved = read.resolve()?;
-                    resolved
-                        .trees
-                        .into_iter()
-                        .filter(|tree| !resolved.sockets.contains(tree))
-                        .collect()
-                }
-                None => Vec::new(),
-            };
             let coverage = Coverage {
                 files: true,
                 reads: guard.watches_reads(),
             };
-            (sandbox_ruleset, guard, pool, held, Some(denied), coverage)
+            (sandbox_ruleset, guard, pool, pool_dirs, held, coverage)
         } else {
-            // Nothing here lists a user's directory: the guard reads only the
-            // mount table, and there is no pool.
             let plan = landlock_rules::plan(config);
             let guard = Guard::new(config, &plan, HashSet::new(), Vec::new())?;
             (
@@ -292,7 +287,7 @@ impl Broker {
                 guard,
                 None,
                 Vec::new(),
-                None,
+                Vec::new(),
                 Coverage {
                     files: false,
                     reads: false,
@@ -300,29 +295,24 @@ impl Broker {
             )
         };
 
-        let program = filter::build(coverage)?;
-        let mut program_bytes = Vec::with_capacity(std::mem::size_of_val(program.as_slice()));
-        for insn in &program {
-            program_bytes.extend_from_slice(&insn.code.to_ne_bytes());
-            program_bytes.push(insn.jt);
-            program_bytes.push(insn.jf);
-            program_bytes.extend_from_slice(&insn.k.to_ne_bytes());
-        }
+        let program_bytes = RwLock::new(encode_coverage_program(coverage)?);
 
         let diagnostics =
             diag::start().map_err(init("cannot start the broker's diagnostics thread"))?;
-        let guard = Arc::new(RwLock::new(guard));
+        let guard = RwLock::new(Arc::new(guard));
         let (jobs, queue) = channel();
+        let (home_commands, home_rx) = channel();
         let (ready, started) = sync_channel(1);
         let launch = Launch {
             held,
+            home_commands: home_commands.clone(),
             setup: home::Setup {
-                guard: Arc::clone(&guard),
                 pool,
                 sink,
                 proxy_port,
                 sync_wake_up: config.broker_sync_wake_up(),
                 diagnostics,
+                commands: home_rx,
             },
         };
         std::thread::Builder::new()
@@ -339,16 +329,21 @@ impl Broker {
             Self {
                 program_bytes,
                 jobs,
+                home_commands,
                 guard,
-                carve_denied,
+                pool_dirs,
+                denylists,
             },
             sandbox_ruleset,
         )))
     }
 
     /// Raw `sock_filter` bytes of the seccomp notification filter.
-    pub(crate) fn program_bytes(&self) -> &[u8] {
-        &self.program_bytes
+    pub(crate) fn program_bytes(&self) -> Vec<u8> {
+        self.program_bytes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Create the `(parent_socket, child_socket)` pair used to hand a listener
@@ -371,12 +366,15 @@ impl Broker {
         Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
     }
 
-    /// Receive a seccomp listener from `listener_socket` and start serving it.
+    /// Receive a seccomp listener from `listener_socket` and start serving it
+    /// under a launch-time snapshot of the current policy guard.
     pub(crate) fn accept_listener(&self, listener_socket: OwnedFd) -> io::Result<()> {
+        let guard = Arc::clone(&self.guard.read().unwrap_or_else(PoisonError::into_inner));
         let (reply, result) = sync_channel(1);
         self.jobs
             .send(AcceptJob {
                 listener_socket,
+                guard,
                 reply,
             })
             .map_err(|_| io::Error::other("the broker's launcher exited"))?;
@@ -385,48 +383,105 @@ impl Broker {
             .map_err(|_| io::Error::other("the broker's launcher exited"))?
     }
 
-    /// Extend `ruleset` and the broker's positive write allowlist with live grants.
-    pub(crate) fn extend_ruleset(
+    /// Rebuild the Landlock ruleset and swap the broker's policy guard for
+    /// commands spawned after this call, leaving already-running commands on
+    /// the guard snapshot they launched with.
+    pub(crate) fn rebuild_policy(
         &self,
-        ruleset: &mut PreparedRuleset,
         config: &SandboxConfigData,
-        new_writable: &[&std::path::Path],
-    ) -> Result<()> {
-        if !new_writable.is_empty() {
-            let mut g = self.guard.write().unwrap_or_else(PoisonError::into_inner);
-            for path in new_writable {
-                g.add_writable_path(path);
-            }
-        }
+        proxy_port: Option<u16>,
+    ) -> Result<PreparedRuleset> {
         let abi = REQUIRED_ABI;
         let plan = landlock_rules::plan(config);
-        match &self.carve_denied {
-            Some(denied) => {
-                let carved = landlock_rules::carve(plan, denied, abi)?;
-                let sandbox_rules = without_writes(&carved.rules, abi);
-                ruleset.add_planned(&sandbox_rules, abi)
-            }
-            None => ruleset.add_planned(&plan, abi),
+        if !self.denylists {
+            let new_guard = Guard::new(config, &plan, HashSet::new(), Vec::new())?;
+            let ruleset = landlock_rules::build_ruleset(config, proxy_port)?;
+            *self.guard.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(new_guard);
+            return Ok(ruleset);
         }
+
+        let pool_dirs = self.pool_dirs.clone();
+        let (outcome, _ours) = on_the_setup_thread(|_socket| -> Result<(Carved, Guard)> {
+            let denied: Vec<PathBuf> = match config.read_denylist() {
+                Some(read) => {
+                    let resolved = read.resolve()?;
+                    resolved
+                        .trees
+                        .into_iter()
+                        .filter(|tree| !resolved.sockets.contains(tree))
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            let carved = landlock_rules::carve(plan.clone(), &denied, abi)?;
+            let ancestors: HashSet<PathBuf> = carved
+                .ancestors
+                .iter()
+                .map(|ancestor| ancestor.path.clone())
+                .collect();
+            let guard = Guard::new(config, &plan, ancestors, pool_dirs)?;
+            Ok((carved, guard))
+        })?;
+        let (carved, new_guard) = outcome?;
+        let sandbox_rules = without_writes(&carved.rules, abi);
+        let ruleset = landlock_rules::instantiate(&sandbox_rules, proxy_port, abi)?;
+        let (reply_tx, reply_rx) = channel();
+        self.home_commands
+            .send(home::HomeCommand::GrantPool {
+                ruleset,
+                reply: reply_tx,
+            })
+            .map_err(|_| Error::InitFailed("the broker's home thread exited".to_owned()))?;
+        let ruleset = reply_rx
+            .recv()
+            .map_err(|_| Error::InitFailed("the broker's home thread exited".to_owned()))??;
+        let new_program = encode_coverage_program(Coverage {
+            files: true,
+            reads: new_guard.watches_reads(),
+        })?;
+        *self
+            .program_bytes
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = new_program;
+        *self.guard.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(new_guard);
+        Ok(ruleset)
     }
+}
+
+fn encode_coverage_program(coverage: Coverage) -> Result<Vec<u8>> {
+    let program = filter::build(coverage)?;
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(program.as_slice()));
+    for insn in &program {
+        bytes.extend_from_slice(&insn.code.to_ne_bytes());
+        bytes.push(insn.jt);
+        bytes.push(insn.jf);
+        bytes.extend_from_slice(&insn.k.to_ne_bytes());
+    }
+    Ok(bytes)
 }
 
 /// What the launcher thread is started with.
 struct Launch {
     /// The inode pool's directories, to send to the home thread.
     held: Vec<OwnedFd>,
+    home_commands: Sender<home::HomeCommand>,
     setup: home::Setup,
 }
 
 /// The launcher's end of the home thread.
 struct HomeLink {
     socket: OwnedFd,
+    commands: Sender<home::HomeCommand>,
     acknowledgements: Receiver<io::Result<()>>,
 }
 
 /// Start the home thread and wait until it is ready.
 fn start_home(launch: Launch) -> io::Result<HomeLink> {
-    let Launch { held, setup } = launch;
+    let Launch {
+        held,
+        home_commands,
+        setup,
+    } = launch;
     let (ours, theirs) = table::socket_pair()?;
     let (acknowledge, acknowledgements) = channel();
     let has_pool = setup.pool.is_some();
@@ -443,14 +498,22 @@ fn start_home(launch: Launch) -> io::Result<HomeLink> {
         .map_err(|_| io::Error::other("the broker's home thread ended before it was ready"))??;
     Ok(HomeLink {
         socket: ours,
+        commands: home_commands,
         acknowledgements,
     })
 }
 
-fn hand_over_listener(home: &HomeLink, listener_socket: &OwnedFd) -> io::Result<()> {
+fn hand_over_listener(
+    home: &HomeLink,
+    guard: Arc<Guard>,
+    listener_socket: &OwnedFd,
+) -> io::Result<()> {
     let listener = table::recv_fds(listener_socket.as_fd())?.ok_or_else(|| {
         io::Error::other("the sandboxed process ended before it handed over its listener")
     })?;
+    home.commands
+        .send(home::HomeCommand::Adopt { guard })
+        .map_err(|_| io::Error::other("the broker's home thread ended"))?;
     let borrowed: Vec<BorrowedFd<'_>> = listener.iter().map(AsFd::as_fd).collect();
     table::send_fds(home.socket.as_fd(), &borrowed)?;
     drop(listener);
@@ -473,7 +536,7 @@ fn launcher(launch: Launch, queue: &Receiver<AcceptJob>, ready: &SyncSender<io::
     };
     let _ = ready.send(Ok(()));
     for job in queue {
-        let outcome = hand_over_listener(&home, &job.listener_socket);
+        let outcome = hand_over_listener(&home, job.guard, &job.listener_socket);
         let _ = job.reply.send(outcome);
     }
 }

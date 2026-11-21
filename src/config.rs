@@ -582,6 +582,21 @@ impl SandboxConfigData {
         self.ipc_socket = path;
     }
 
+    /// Replace the configured grants wholesale, keeping path deduplication.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn replace_grants(&mut self, grants: impl IntoIterator<Item = Grant>) {
+        self.grants.clear();
+        for grant in grants {
+            self.push_grant(grant.resolved_path().clone(), grant.access());
+        }
+    }
+
+    /// Replace the configured read denylist wholesale.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_read_denylist(&mut self, denylist: Option<ReadDenylist>) {
+        self.read_denylist = denylist;
+    }
+
     /// Add `access` to what the sandboxed process may do with `path`.
     ///
     /// A path granted twice keeps the union of both grants, so a directory that

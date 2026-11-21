@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const OP_SPAWN: u8 = 1;
 const OP_KILL: u8 = 2;
 #[cfg(target_os = "macos")]
-const OP_GRANT: u8 = 3;
+const OP_SYNC_EXTENSIONS: u8 = 3;
 #[cfg(target_os = "linux")]
 const OP_SPAWN_CHILD_RUNNER: u8 = 4;
 
@@ -254,6 +254,8 @@ unsafe extern "C" {
     fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
     #[cfg(target_os = "macos")]
     fn sandbox_extension_consume(token: *const c_char) -> i64;
+    #[cfg(target_os = "macos")]
+    fn sandbox_extension_release(extension_handle: i64) -> c_int;
 
     #[cfg(target_os = "linux")]
     fn poll(fds: *mut linux_ev::PollFd, nfds: c_uint, timeout: c_int) -> c_int;
@@ -817,13 +819,31 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
 }
 
 #[cfg(target_os = "macos")]
-fn consume_tokens(tokens: &[CString]) -> io::Result<()> {
-    for token in tokens {
+fn sync_extensions(
+    active: &mut HashMap<String, i64>,
+    release_keys: &[String],
+    add_entries: &[(String, CString)],
+) -> io::Result<()> {
+    for key in release_keys {
+        if let Some(handle) = active.remove(key) {
+            // SAFETY: `handle` was returned by a prior `sandbox_extension_consume`.
+            let rc = unsafe { sandbox_extension_release(handle) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    for (key, token) in add_entries {
+        if let Some(prev) = active.remove(key) {
+            // SAFETY: `prev` was returned by `sandbox_extension_consume`.
+            let _ = unsafe { sandbox_extension_release(prev) };
+        }
         // SAFETY: `token` is a NUL-terminated C string issued by `sandbox_extension_issue_file`.
         let handle = unsafe { sandbox_extension_consume(token.as_ptr()) };
         if handle < 0 {
             return Err(io::Error::last_os_error());
         }
+        active.insert(key.clone(), handle);
     }
     Ok(())
 }
@@ -1648,20 +1668,6 @@ fn handle_spawn(
     let nice = cur.opt_i32()?;
     let io_policy = cur.opt_i32()?;
 
-    #[cfg(target_os = "macos")]
-    let extra_tokens = {
-        let n = cur.u32()? as usize;
-        let mut list = Vec::with_capacity(n);
-        for _ in 0..n {
-            let s = cur.string()?;
-            list.push(
-                CString::new(s)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            );
-        }
-        list
-    };
-
     #[cfg(target_os = "linux")]
     let (has_ruleset, notif_prog, filter_progs, extra_targets) = {
         let has_ruleset = cur.u8()? != 0;
@@ -1738,7 +1744,6 @@ fn handle_spawn(
             }
             let _ = signal(SIGCHLD, SIG_DFL);
             let _ = signal(SIGPIPE, SIG_DFL);
-            consume_tokens(&extra_tokens)?;
             apply_limits_and_priority(&limits, nice, io_policy)
         });
     }
@@ -1916,6 +1921,8 @@ fn init_serve_watcher(control: &UnixStream) -> io::Result<(SigSet, Watcher)> {
 
 fn serve(mut control: UnixStream, original_mask: SigSet, watcher: Watcher) -> ExitCode {
     let mut children: HashMap<u32, Child> = HashMap::new();
+    #[cfg(target_os = "macos")]
+    let mut extensions: HashMap<String, i64> = HashMap::new();
 
     loop {
         let Ok(ready) = watcher.wait() else {
@@ -1966,18 +1973,25 @@ fn serve(mut control: UnixStream, original_mask: SigSet, watcher: Watcher) -> Ex
                     send_frame(&mut control, &reply)
                 })(),
                 #[cfg(target_os = "macos")]
-                OP_GRANT => (|| -> io::Result<()> {
+                OP_SYNC_EXTENSIONS => (|| -> io::Result<()> {
                     let req_id = cur.u64()?;
-                    let count = cur.u32()? as usize;
-                    let mut tokens = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        let s = cur.string()?;
-                        tokens.push(
-                            CString::new(s)
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-                        );
+                    let release_count = cur.u32()? as usize;
+                    let mut release_keys = Vec::with_capacity(release_count);
+                    for _ in 0..release_count {
+                        release_keys.push(cur.string()?);
                     }
-                    match consume_tokens(&tokens) {
+                    let add_count = cur.u32()? as usize;
+                    let mut add_entries = Vec::with_capacity(add_count);
+                    for _ in 0..add_count {
+                        let key = cur.string()?;
+                        let tok = cur.string()?;
+                        add_entries.push((
+                            key,
+                            CString::new(tok)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                        ));
+                    }
+                    match sync_extensions(&mut extensions, &release_keys, &add_entries) {
                         Ok(()) => {
                             let mut reply = vec![EV_ACK];
                             reply.extend_from_slice(&req_id.to_le_bytes());

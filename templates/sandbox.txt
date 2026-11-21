@@ -338,6 +338,8 @@
 (deny file-read-data (literal "{{ listing }}") {{ audit }})
 {% endfor %}
 {% endfor %}
+; Dynamic read denials consumed at runtime through `sandbox_extension_consume`.
+(deny file-read* file-write* file-write-create file-write-unlink (extension "heel.deny.read") {{ audit }})
 ; The directories above a protected location, home and above included: none is
 ; moved or removed, and nothing is made under its name at all — a prepared tree
 ; renamed into one is a create SBPL cannot tell from a plain `mkdir`.

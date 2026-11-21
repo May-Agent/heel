@@ -458,7 +458,13 @@ pub(crate) fn generate_profile_with_runner(
     let read_rules = read_resolved.as_ref().map(HostRules::new).transpose()?;
 
     let template = SandboxProfile {
-        grants,
+        // Under a persistent non-strict runner, grants are issued as revocable
+        // Seatbelt extension tokens so `Sandbox::set_grants` can release them.
+        grants: if runner_executable.is_some() && !config.filesystem_strict() {
+            Vec::new()
+        } else {
+            grants
+        },
         runner_executable: runner_executable.map(sbpl_path).transpose()?,
         working_dir: sbpl_path(config.working_dir())?,
         executable_working_dir: config.working_dir_is_executable(),
