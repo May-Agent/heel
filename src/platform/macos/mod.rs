@@ -33,11 +33,10 @@ pub struct MacOSBackend {
     profile: String,
     /// Persistent in-sandbox runner for confined sandboxes (`None` under `host_access`).
     runner: Option<Arc<Runner>>,
-    /// Read/exec initial grants compiled into static SBPL because XNU refused
-    /// `sandbox_extension_issue_file` (`EPERM` on TCC-protected `.app` bundles
-    /// under `launchd`).
+    /// Baseline grants compiled into the static SBPL profile at sandbox creation
+    /// time; never passed to `sandbox_extension_issue_file`.
     static_grants: Vec<Grant>,
-    /// Keys of Seatbelt extensions currently active inside `runner`.
+    /// Keys of dynamic Seatbelt extensions currently active inside `runner`.
     active_keys: Mutex<BTreeSet<String>>,
 }
 
@@ -80,47 +79,15 @@ impl MacOSBackend {
         }
 
         let staged = StagedRunner::create()?;
-        let mut static_grants = Vec::new();
-        let mut initial_extensions = Vec::new();
-        let mut initial_keys = BTreeSet::new();
-        if !config.filesystem_strict() {
-            for grant in config.grants() {
-                let key = grant_extension_key(grant);
-                if initial_keys.contains(&key) {
-                    continue;
-                }
-                match issue_macos_extension(grant) {
-                    Ok(token) => {
-                        initial_keys.insert(key.clone());
-                        initial_extensions.push((key, token));
-                    }
-                    Err(Error::Path { source, .. })
-                        if !grant.access().can_write()
-                            && source.raw_os_error() == Some(libc::EPERM) =>
-                    {
-                        static_grants.push(grant.clone());
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-        }
-        let static_override = (!config.filesystem_strict()).then_some(static_grants.as_slice());
-        let profile = profile::generate_profile_with_runner(
-            config,
-            proxy_port,
-            Some(staged.path()),
-            static_override,
-        )?;
+        let profile =
+            profile::generate_profile_with_runner(config, proxy_port, Some(staged.path()))?;
         let setup = PreExecSetup::new(config)?;
         let runner = Runner::start_macos(staged, &profile, setup)?;
-        if !initial_extensions.is_empty() {
-            runner.sync_extensions(&[], &initial_extensions)?;
-        }
         Ok(Self {
             profile,
             runner: Some(runner),
-            static_grants,
-            active_keys: Mutex::new(initial_keys),
+            static_grants: config.grants().to_vec(),
+            active_keys: Mutex::new(BTreeSet::new()),
         })
     }
 

@@ -290,18 +290,22 @@ async fn nested_linux_container_allows_parent_to_child_signals_denies_reverse_an
 
 #[tokio::test]
 async fn set_grants_revokes_previous_grants_and_applies_dynamic_read_denials() {
+    use heel::{Access, Grant};
+
     let dir = fixtures::tempdir();
     let dir_path = std::fs::canonicalize(dir.path()).unwrap();
     let secret_dir = fixtures::tempdir();
     let secret_path = std::fs::canonicalize(secret_dir.path()).unwrap();
     std::fs::write(secret_path.join("secret.txt"), "classified\n").unwrap();
 
-    let sandbox = start(
-        SandboxConfigBuilder::default()
-            .filesystem_strict(false)
-            .writable(fixtures::resolved(&dir_path)),
-    )
-    .await;
+    let sandbox = start(SandboxConfigBuilder::default().filesystem_strict(false)).await;
+    sandbox
+        .set_grants(
+            [Grant::new(fixtures::resolved(&dir_path), Access::WRITE)],
+            [],
+        )
+        .await
+        .expect("set_grants grants writable dir dynamically");
 
     let write_first = sh(
         &sandbox,

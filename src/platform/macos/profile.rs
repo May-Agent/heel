@@ -372,18 +372,14 @@ struct HostProfile {
 /// host-access configuration instead renders the profile that confines
 /// nothing and keeps only the attribution pair.
 pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<String> {
-    generate_profile_with_runner(config, proxy_port, None, None)
+    generate_profile_with_runner(config, proxy_port, None)
 }
 
-/// Generate an SBPL profile that also permits executing a staged persistent
-/// runner. When `static_grants_override` is `Some`, only those grants are
-/// emitted statically into SBPL while the remaining grants are managed via
-/// Seatbelt file extension tokens.
+/// Generate an SBPL profile that also permits executing a staged persistent runner.
 pub(crate) fn generate_profile_with_runner(
     config: &SandboxConfigData,
     proxy_port: Option<u16>,
     runner_executable: Option<&Path>,
-    static_grants_override: Option<&[Grant]>,
 ) -> Result<String> {
     let attribution = config.attribution().ok_or_else(|| {
         Error::InitFailed(
@@ -462,10 +458,7 @@ pub(crate) fn generate_profile_with_runner(
     let read_rules = read_resolved.as_ref().map(HostRules::new).transpose()?;
 
     let template = SandboxProfile {
-        grants: match static_grants_override {
-            Some(subset) => grant_rules(subset)?,
-            None => grants,
-        },
+        grants,
         runner_executable: runner_executable.map(sbpl_path).transpose()?,
         working_dir: sbpl_path(config.working_dir())?,
         executable_working_dir: config.working_dir_is_executable(),
