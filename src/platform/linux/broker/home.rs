@@ -137,7 +137,8 @@ struct Serving {
 /// What a handler needs to serve one call.
 pub(crate) struct Context<'a> {
     serving: &'a Arc<Serving>,
-    after_continue: std::cell::Cell<Option<(u32, Held<'a>)>>,
+    after_continue:
+        std::cell::Cell<Option<(u32, Option<Held<'a>>, super::resolve::FrozenSiblings)>>,
 }
 
 impl<'a> Context<'a> {
@@ -145,11 +146,17 @@ impl<'a> Context<'a> {
         &self.serving.shared
     }
 
-    /// Keep `held` across `SECCOMP_USER_NOTIF_FLAG_CONTINUE` until `tid` has
-    /// finished or settled in its `connect` call, preventing a concurrent
-    /// brokered `symlink`/`rename` from swapping the path between check and lookup.
-    pub(crate) fn hold_across_continue(&self, tid: u32, held: Held<'a>) {
-        self.after_continue.set(Some((tid, held)));
+    /// Keep `held` and `frozen` across `SECCOMP_USER_NOTIF_FLAG_CONTINUE` until
+    /// `tid` has finished or settled in its `connect` call, preventing a
+    /// concurrent sibling thread or brokered `symlink`/`rename` from mutating
+    /// the address buffer, socket fd, or pathname between check and lookup.
+    pub(crate) fn hold_across_continue(
+        &self,
+        tid: u32,
+        held: Option<Held<'a>>,
+        frozen: super::resolve::FrozenSiblings,
+    ) {
+        self.after_continue.set(Some((tid, held, frozen)));
     }
 
     /// Make sure another thread is listening before this one blocks in a call
@@ -255,7 +262,7 @@ fn serve(serving: &Arc<Serving>, notification: &libc::seccomp_notif) {
             .shared
             .say(Diagnostic::debug("broker: reply failed").field("error", error));
     }
-    if let Some((tid, _held)) = after_continue {
+    if let Some((tid, _held, _frozen)) = after_continue {
         wait_connect_settled(tid, i64::from(notification.data.nr));
     }
 }

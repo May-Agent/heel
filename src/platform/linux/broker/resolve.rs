@@ -33,6 +33,31 @@ pub(crate) const AT_FDCWD: i32 = -100;
 /// `PROC_SUPER_MAGIC`.
 const PROC_SUPER_MAGIC: i64 = 0x9fa0;
 
+/// Sibling threads in the caller's thread group held in `PTRACE_EVENT_STOP`
+/// across a continued syscall so they cannot mutate the caller's memory or
+/// descriptor table between validation and kernel entry.
+pub(crate) struct FrozenSiblings {
+    attached: Vec<(libc::pid_t, libc::c_int)>,
+}
+
+impl FrozenSiblings {
+    pub(crate) fn had_siblings(&self) -> bool {
+        !self.attached.is_empty()
+    }
+}
+
+impl Drop for FrozenSiblings {
+    fn drop(&mut self) {
+        for &(tid, sig) in &self.attached {
+            // SAFETY: `PTRACE_DETACH` takes integer arguments and detaches a
+            // thread this worker seized, re-delivering any pending signal `sig`.
+            unsafe {
+                libc::ptrace(libc::PTRACE_DETACH, tid, 0, sig);
+            }
+        }
+    }
+}
+
 /// Symbolic links followed by hand before giving up, as in the kernel.
 const MAX_SYMLINKS: usize = 40;
 
@@ -114,14 +139,32 @@ impl<'a> Caller<'a> {
         Ok(bytes)
     }
 
-    /// Whether `[address, address + length)` cannot be mutated while this task
-    /// remains stopped in its notification: the thread group has a single
-    /// thread (`seccomp_filter` blocks bare `CLONE_VM`) and every page of the
-    /// slice belongs to a readable `MAP_PRIVATE` mapping.
-    pub(crate) fn has_private_buffer(&self, address: u64, length: usize) -> io::Result<bool> {
-        if length == 0 || self.status()?.threads != 1 {
-            return Ok(false);
+    /// Verify `[address, address + length)` belongs to a readable `MAP_PRIVATE`
+    /// mapping and, when the thread group has sibling threads, quiesce every
+    /// sibling in `PTRACE_EVENT_STOP` so neither the buffer nor the descriptor
+    /// table can change while this task remains stopped.
+    pub(crate) fn freeze_for_private_buffer(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> io::Result<Option<FrozenSiblings>> {
+        if length == 0 {
+            return Ok(None);
         }
+        let status = self.status()?;
+        let mut frozen = FrozenSiblings {
+            attached: Vec::new(),
+        };
+        if status.threads > 1 && !self.seize_siblings(status.tgid, &mut frozen)? {
+            return Ok(None);
+        }
+        if !self.is_private_mapping(address, length)? {
+            return Ok(None);
+        }
+        Ok(Some(frozen))
+    }
+
+    fn is_private_mapping(&self, address: u64, length: usize) -> io::Result<bool> {
         let Some(end) = address.checked_add(length as u64) else {
             return Ok(false);
         };
@@ -158,6 +201,84 @@ impl<'a> Caller<'a> {
             cursor = hi;
         }
         self.still_valid()?;
+        Ok(false)
+    }
+
+    fn seize_siblings(&self, tgid: u32, frozen: &mut FrozenSiblings) -> io::Result<bool> {
+        let task_dir = format!("/proc/{tgid}/task");
+        for _ in 0..4 {
+            let entries = std::fs::read_dir(&task_dir)?;
+            let mut added_any = false;
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                let Some(tid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if tid == self.tid {
+                    continue;
+                }
+                let pid = tid as libc::pid_t;
+                if frozen.attached.iter().any(|&(seen, _)| seen == pid) {
+                    continue;
+                }
+                // SAFETY: `PTRACE_SEIZE` attaches without stopping or signaling.
+                let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) };
+                if rc != 0 {
+                    if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                frozen.attached.push((pid, 0));
+                added_any = true;
+                // SAFETY: `PTRACE_INTERRUPT` places a seized tracee into `PTRACE_EVENT_STOP`.
+                let rc = unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) };
+                if rc != 0 {
+                    if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                let pending_sig = loop {
+                    let mut wait_status: libc::c_int = 0;
+                    // SAFETY: `waitpid` writes one `c_int` for the seized tracee `pid`.
+                    let waited = unsafe { libc::waitpid(pid, &raw mut wait_status, libc::__WALL) };
+                    if waited < 0 {
+                        let err = io::Error::last_os_error().raw_os_error();
+                        if err == Some(libc::EINTR) {
+                            continue;
+                        }
+                        if err == Some(libc::ECHILD) || err == Some(libc::ESRCH) {
+                            break None;
+                        }
+                        return Ok(false);
+                    }
+                    if libc::WIFSTOPPED(wait_status) {
+                        let event = (wait_status >> 16) & 0xffff;
+                        if event == libc::PTRACE_EVENT_STOP {
+                            break Some(0);
+                        }
+                        break Some(libc::WSTOPSIG(wait_status));
+                    }
+                    break None;
+                };
+                if let Some(sig) = pending_sig
+                    && let Some(last) = frozen.attached.last_mut()
+                {
+                    last.1 = sig;
+                }
+            }
+            if !added_any {
+                self.still_valid()?;
+                return Ok(true);
+            }
+        }
         Ok(false)
     }
 
