@@ -215,22 +215,66 @@ fn perform(call: &Call<'_>, which: Syscall, address: &[u8]) -> Out {
     }
 }
 
+/// Whether the caller's socket descriptor currently refers to an `AF_UNIX` socket.
+fn is_unix_socket(call: &Call<'_>) -> Result<bool, Errno> {
+    let tgid = call.caller.status()?.tgid;
+    let socket = notify::steal_fd(tgid, call.args[0] as i32)?;
+    call.caller.still_valid()?;
+    let mut domain: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `socket` is an open descriptor and `domain`/`len` name one `c_int`.
+    let rc = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            (&raw mut domain).cast(),
+            &raw mut len,
+        )
+    };
+    Ok(rc == 0 && domain == libc::AF_UNIX)
+}
+
 /// A unix socket at a path: resolved against held directories, judged by real
 /// path and inode, and either continued in the caller when its address buffer
-/// is private to a single thread (so the kernel records the caller's own
-/// `SO_PEERCRED`) or reached through the held parent directory by the broker.
+/// is private and sibling threads are quiesced (so the kernel records the
+/// caller's own `SO_PEERCRED`) or reached through the held parent directory by
+/// the broker.
 fn unix(ctx: &Context, call: &Call<'_>, path: &[u8], raw_len: usize, which: Syscall) -> Out {
     let shared = ctx.shared();
-    let can_continue = which == Syscall::Connect
-        && call
-            .caller
-            .has_private_buffer(call.args[1], raw_len)
-            .unwrap_or(false);
+    let mut frozen = if which == Syscall::Connect {
+        call.caller
+            .freeze_for_private_buffer(call.args[1], raw_len)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let mut rechecked_path: Option<Vec<u8>> = None;
+    if let Some(ref f) = frozen {
+        if !is_unix_socket(call).unwrap_or(false) {
+            frozen = None;
+        } else if f.had_siblings() {
+            match parse(call)?.address {
+                Address::Path(fresh) => rechecked_path = Some(fresh),
+                Address::Abstract if shared.guard().abstract_sockets_denied() => {
+                    return Err(refuse_network(
+                        ctx,
+                        call,
+                        Operation::NetworkOutbound,
+                        "abstract socket",
+                    ));
+                }
+                _ => frozen = None,
+            }
+        }
+    }
+    let effective_path = rechecked_path.as_deref().unwrap_or(path);
     // The name must stay the name from the check to the call that uses it. A
     // bind is served under the lock already; a continued connect takes the
     // exclusive side so no brokered directory mutation runs until the kernel
     // finishes looking up the socket path.
-    let held = match (which, can_continue, shared.guard().watches_reads()) {
+    let held = match (which, frozen.is_some(), shared.guard().watches_reads()) {
         (Syscall::Connect, true, true) => Some(shared.exclusive_lock()),
         (Syscall::Connect, false, _) => Some(shared.read_lock()),
         _ => None,
@@ -238,7 +282,7 @@ fn unix(ctx: &Context, call: &Call<'_>, path: &[u8], raw_len: usize, which: Sysc
     let mut place = resolve::resolve(
         call.caller,
         Base::Dirfd(AT_FDCWD),
-        path,
+        effective_path,
         ResolveFlags::empty(),
     )?;
     if which == Syscall::Connect {
@@ -251,10 +295,8 @@ fn unix(ctx: &Context, call: &Call<'_>, path: &[u8], raw_len: usize, which: Sysc
             if shared.guard().socket_denied(&target, id) {
                 return Err(refuse(ctx, call, Operation::NetworkOutbound, &target));
             }
-            if can_continue {
-                if let Some(lock) = held {
-                    ctx.hold_across_continue(call.caller.tid, lock);
-                }
+            if let Some(frozen) = frozen {
+                ctx.hold_across_continue(call.caller.tid, held, frozen);
                 return Ok(Reply::Continue);
             }
         }

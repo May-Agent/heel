@@ -436,17 +436,22 @@ async fn unix_sockets_connect_in_writable_grants_and_honor_read_denylist() {
 
     let host_pid = std::process::id();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = allowed_listener.accept().expect("accept");
-        let peer_pid = unix_peer_pid(&stream);
-        assert!(peer_pid > 0, "peer PID must be non-zero, got {peer_pid}");
-        assert_ne!(
-            peer_pid, host_pid,
-            "peer PID must identify the connecting sandboxed child, not the host broker"
-        );
-        let mut buf = [0_u8; 4];
-        stream.read_exact(&mut buf).expect("read ping");
-        assert_eq!(&buf, b"ping");
-        stream.write_all(b"pong").expect("write pong");
+        for round in ["single-threaded", "multi-threaded"] {
+            let (mut stream, _) = allowed_listener.accept().expect("accept");
+            let peer_pid = unix_peer_pid(&stream);
+            assert!(
+                peer_pid > 0,
+                "{round}: peer PID must be non-zero, got {peer_pid}"
+            );
+            assert_ne!(
+                peer_pid, host_pid,
+                "{round}: peer PID must identify the connecting sandboxed child, not the host broker"
+            );
+            let mut buf = [0_u8; 4];
+            stream.read_exact(&mut buf).expect("read ping");
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").expect("write pong");
+        }
     });
 
     let config = SandboxConfigBuilder::default()
@@ -461,23 +466,32 @@ async fn unix_sockets_connect_in_writable_grants_and_honor_read_denylist() {
         .await
         .expect("sandbox starts");
 
-    let connect_script = |sock: &std::path::Path| {
-        format!(
-            "python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX); s.settimeout(2.0); s.connect(sys.argv[1]); s.sendall(b\"ping\"); sys.stdout.write(s.recv(4).decode())' '{}'",
-            sock.display()
-        )
+    let connect_script = |sock: &std::path::Path, multithreaded: bool| {
+        if multithreaded {
+            format!(
+                "python3 -c 'import socket, sys, threading; ev = threading.Event(); t = threading.Thread(target=ev.wait, daemon=True); t.start();\ntry:\n s = socket.socket(socket.AF_UNIX); s.settimeout(2.0); s.connect(sys.argv[1]); s.sendall(b\"ping\"); sys.stdout.write(s.recv(4).decode())\nfinally:\n ev.set(); t.join()' '{}'",
+                sock.display()
+            )
+        } else {
+            format!(
+                "python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX); s.settimeout(2.0); s.connect(sys.argv[1]); s.sendall(b\"ping\"); sys.stdout.write(s.recv(4).decode())' '{}'",
+                sock.display()
+            )
+        }
     };
 
-    let ok = sh(&sandbox, &connect_script(&allowed_sock)).await;
-    assert!(
-        ok.status.success(),
-        "connecting to a Unix socket in a writable grant must succeed: {}",
-        String::from_utf8_lossy(&ok.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&ok.stdout), "pong");
+    for multithreaded in [false, true] {
+        let ok = sh(&sandbox, &connect_script(&allowed_sock, multithreaded)).await;
+        assert!(
+            ok.status.success(),
+            "connecting to a Unix socket in a writable grant must succeed (mt={multithreaded}): {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&ok.stdout), "pong");
+    }
     server.join().expect("server thread");
 
-    let denied = sh(&sandbox, &connect_script(&denied_sock)).await;
+    let denied = sh(&sandbox, &connect_script(&denied_sock, true)).await;
     assert!(
         !denied.status.success(),
         "connecting to a denylisted Unix socket must fail"
