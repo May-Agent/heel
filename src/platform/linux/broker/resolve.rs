@@ -43,6 +43,8 @@ pub(crate) struct Status {
     pub tgid: u32,
     /// The file creation mask the task's calls are made under.
     pub umask: u32,
+    /// Number of threads in the task's thread group.
+    pub threads: u32,
 }
 
 fn read_status(tid: u32) -> io::Result<Status> {
@@ -56,6 +58,7 @@ fn read_status(tid: u32) -> io::Result<Status> {
     Ok(Status {
         tgid: field("Tgid:", 10)?,
         umask: field("Umask:", 8)?,
+        threads: field("Threads:", 10)?,
     })
 }
 
@@ -109,6 +112,53 @@ impl<'a> Caller<'a> {
         let bytes = notify::read_memory(self.tid, address, length)?;
         self.still_valid()?;
         Ok(bytes)
+    }
+
+    /// Whether `[address, address + length)` cannot be mutated while this task
+    /// remains stopped in its notification: the thread group has a single
+    /// thread (`seccomp_filter` blocks bare `CLONE_VM`) and every page of the
+    /// slice belongs to a readable `MAP_PRIVATE` mapping.
+    pub(crate) fn has_private_buffer(&self, address: u64, length: usize) -> io::Result<bool> {
+        if length == 0 || self.status()?.threads != 1 {
+            return Ok(false);
+        }
+        let Some(end) = address.checked_add(length as u64) else {
+            return Ok(false);
+        };
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", self.tid))?;
+        let mut cursor = address;
+        for line in maps.lines() {
+            let mut columns = line.split_whitespace();
+            let Some(range) = columns.next() else {
+                continue;
+            };
+            let Some(perms) = columns.next() else {
+                continue;
+            };
+            let Some((lo_hex, hi_hex)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(lo), Ok(hi)) = (
+                u64::from_str_radix(lo_hex, 16),
+                u64::from_str_radix(hi_hex, 16),
+            ) else {
+                continue;
+            };
+            if hi <= cursor {
+                continue;
+            }
+            if lo > cursor || !perms.starts_with('r') || !perms.ends_with('p') {
+                self.still_valid()?;
+                return Ok(false);
+            }
+            if hi >= end {
+                self.still_valid()?;
+                return Ok(true);
+            }
+            cursor = hi;
+        }
+        self.still_valid()?;
+        Ok(false)
     }
 
     /// The directory a relative path is looked up in: the task's working

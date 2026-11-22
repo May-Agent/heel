@@ -107,6 +107,12 @@ impl Shared {
         self.hold_for(Syscall::Open)
     }
 
+    /// The exclusive side of the lock, blocking concurrent directory mutations
+    /// while a continued `connect` resolves its pathname in the kernel.
+    pub(crate) fn exclusive_lock(&self) -> Held<'_> {
+        self.hold_for(Syscall::Rename)
+    }
+
     /// Whether a connection to `ip:port` is the one the sandbox may make.
     pub(crate) fn proxy_reachable(&self, ip: Ipv4Addr, port: u16) -> bool {
         ip == crate::network::PROXY_ADDRESS && self.home.proxy_port == Some(port)
@@ -131,11 +137,19 @@ struct Serving {
 /// What a handler needs to serve one call.
 pub(crate) struct Context<'a> {
     serving: &'a Arc<Serving>,
+    after_continue: std::cell::Cell<Option<(u32, Held<'a>)>>,
 }
 
-impl Context<'_> {
-    pub(crate) fn shared(&self) -> &Shared {
+impl<'a> Context<'a> {
+    pub(crate) fn shared(&self) -> &'a Shared {
         &self.serving.shared
+    }
+
+    /// Keep `held` across `SECCOMP_USER_NOTIF_FLAG_CONTINUE` until `tid` has
+    /// finished or settled in its `connect` call, preventing a concurrent
+    /// brokered `symlink`/`rename` from swapping the path between check and lookup.
+    pub(crate) fn hold_across_continue(&self, tid: u32, held: Held<'a>) {
+        self.after_continue.set(Some((tid, held)));
     }
 
     /// Make sure another thread is listening before this one blocks in a call
@@ -225,17 +239,50 @@ fn serve(serving: &Arc<Serving>, notification: &libc::seccomp_notif) {
         args: notification.data.args,
         caller: &caller,
     };
-    let context = Context { serving };
+    let context = Context {
+        serving,
+        after_continue: std::cell::Cell::new(None),
+    };
     let reply = match ops::serve(&context, &call) {
         Ok(reply) => reply,
         Err(Errno(errno)) => Reply::Errno(errno),
     };
+    let after_continue = context.after_continue.take();
     if let Err(error) = listener.reply(id, reply)
         && error.raw_os_error() != Some(libc::ENOENT)
     {
         serving
             .shared
             .say(Diagnostic::debug("broker: reply failed").field("error", error));
+    }
+    if let Some((tid, _held)) = after_continue {
+        wait_connect_settled(tid, i64::from(notification.data.nr));
+    }
+}
+
+/// Wait briefly after `SECCOMP_USER_NOTIF_FLAG_CONTINUE` until `tid` leaves
+/// `connect` (common case: microseconds under `SYNC_WAKE_UP`) or up to 5 ms if
+/// the peer's listen backlog is full (`unix_find_other` runs at the very start
+/// of `unix_stream_connect` before any backlog wait).
+fn wait_connect_settled(tid: u32, connect_nr: i64) {
+    let path = format!("/proc/{tid}/syscall");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+    for spin in 0u32.. {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            break;
+        };
+        let first = text.split_whitespace().next().unwrap_or("");
+        if first != connect_nr.to_string() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        if spin < 8 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
     }
 }
 

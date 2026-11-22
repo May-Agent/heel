@@ -120,7 +120,9 @@ pub(crate) fn connect(ctx: &Context, call: &Call<'_>) -> Out {
                 "abstract socket",
             ));
         }
-        Address::Path(path) => return unix(ctx, call, path, Syscall::Connect),
+        Address::Path(path) => {
+            return unix(ctx, call, path, parsed.bytes.len(), Syscall::Connect);
+        }
         Address::Abstract | Address::Other => {}
     }
     let blocking = socket_blocks(call)?;
@@ -163,7 +165,7 @@ pub(crate) fn bind(ctx: &Context, call: &Call<'_>) -> Out {
                 "abstract socket",
             ));
         }
-        Address::Path(path) => return unix(ctx, call, path, Syscall::Bind),
+        Address::Path(path) => return unix(ctx, call, path, parsed.bytes.len(), Syscall::Bind),
         Address::Abstract | Address::Other => {}
     }
     perform(call, Syscall::Bind, &parsed.bytes)
@@ -214,13 +216,25 @@ fn perform(call: &Call<'_>, which: Syscall, address: &[u8]) -> Out {
 }
 
 /// A unix socket at a path: resolved against held directories, judged by real
-/// path and inode, and reached through its directory so the name is the one
-/// that was judged.
-fn unix(ctx: &Context, call: &Call<'_>, path: &[u8], which: Syscall) -> Out {
+/// path and inode, and either continued in the caller when its address buffer
+/// is private to a single thread (so the kernel records the caller's own
+/// `SO_PEERCRED`) or reached through the held parent directory by the broker.
+fn unix(ctx: &Context, call: &Call<'_>, path: &[u8], raw_len: usize, which: Syscall) -> Out {
     let shared = ctx.shared();
+    let can_continue = which == Syscall::Connect
+        && call
+            .caller
+            .has_private_buffer(call.args[1], raw_len)
+            .unwrap_or(false);
     // The name must stay the name from the check to the call that uses it. A
-    // bind is served under the lock already; a connect is not.
-    let _held = (which == Syscall::Connect).then(|| shared.read_lock());
+    // bind is served under the lock already; a continued connect takes the
+    // exclusive side so no brokered directory mutation runs until the kernel
+    // finishes looking up the socket path.
+    let held = match (which, can_continue, shared.guard().watches_reads()) {
+        (Syscall::Connect, true, true) => Some(shared.exclusive_lock()),
+        (Syscall::Connect, false, _) => Some(shared.read_lock()),
+        _ => None,
+    };
     let mut place = resolve::resolve(
         call.caller,
         Base::Dirfd(AT_FDCWD),
@@ -236,6 +250,12 @@ fn unix(ctx: &Context, call: &Call<'_>, path: &[u8], which: Syscall) -> Out {
             let id = place.stat().ok().map(|stat| (stat.st_dev, stat.st_ino));
             if shared.guard().socket_denied(&target, id) {
                 return Err(refuse(ctx, call, Operation::NetworkOutbound, &target));
+            }
+            if can_continue {
+                if let Some(lock) = held {
+                    ctx.hold_across_continue(call.caller.tid, lock);
+                }
+                return Ok(Reply::Continue);
             }
         }
         Syscall::Bind => {
