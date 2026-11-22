@@ -190,23 +190,40 @@ fn socket_rules(allow_tcp: bool) -> Result<Vec<SeccompRule>> {
     Ok(rules)
 }
 
-/// Block `clone` calls that would create a new user namespace.
+/// Block `clone` calls that create a new user namespace or share `CLONE_VM`
+/// across separate thread groups without `CLONE_VFORK`.
 ///
-/// `unshare` is blocked outright below, but `clone(CLONE_NEWUSER)` reaches the
-/// same capability-granting namespace by another path.
+/// `unshare` is blocked outright below, while `clone(CLONE_NEWUSER)` reaches
+/// the same capability-granting namespace by another path. Blocking bare
+/// `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK` ensures a process with
+/// `Threads: 1` in `/proc/<tid>/status` has no running peer sharing its private
+/// mappings while stopped in a seccomp notification.
 fn namespace_clone_rules() -> Result<Vec<SeccompRule>> {
-    let flags = libc::CLONE_NEWUSER as u64;
-    let condition = SeccompCondition::new(
+    let userns = libc::CLONE_NEWUSER as u64;
+    let userns_cond = SeccompCondition::new(
         0,
         SeccompCmpArgLen::Qword,
-        SeccompCmpOp::MaskedEq(flags),
-        flags,
+        SeccompCmpOp::MaskedEq(userns),
+        userns,
     )
     .map_err(|e| Error::InvalidProfile(format!("seccomp condition error: {e:?}")))?;
 
-    Ok(vec![SeccompRule::new(vec![condition]).map_err(|e| {
-        Error::InvalidProfile(format!("seccomp rule error: {e:?}"))
-    })?])
+    let vm_mask = (libc::CLONE_VM | libc::CLONE_THREAD | libc::CLONE_VFORK) as u64;
+    let bare_vm = libc::CLONE_VM as u64;
+    let bare_vm_cond = SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Qword,
+        SeccompCmpOp::MaskedEq(vm_mask),
+        bare_vm,
+    )
+    .map_err(|e| Error::InvalidProfile(format!("seccomp condition error: {e:?}")))?;
+
+    let userns_rule = SeccompRule::new(vec![userns_cond])
+        .map_err(|e| Error::InvalidProfile(format!("seccomp rule error: {e:?}")))?;
+    let bare_vm_rule = SeccompRule::new(vec![bare_vm_cond])
+        .map_err(|e| Error::InvalidProfile(format!("seccomp rule error: {e:?}")))?;
+
+    Ok(vec![userns_rule, bare_vm_rule])
 }
 
 /// `TIOCSTI` and `TIOCLINUX` push input into, or take over, a terminal the

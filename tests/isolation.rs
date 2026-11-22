@@ -374,6 +374,47 @@ async fn a_configured_path_removed_before_creation_fails_sandbox_creation() {
     );
 }
 
+/// Peer PID reported by the kernel for an accepted Unix domain socket stream.
+fn unix_peer_pid(stream: &std::os::unix::net::UnixStream) -> u32 {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `libc::ucred` is plain old data of integers.
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `stream` is an open socket fd and `cred`/`len` name a valid buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(SO_PEERCRED) failed");
+        u32::try_from(cred.pid).expect("positive peer pid")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: `stream` is an open socket fd and `pid`/`len` name a valid buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                libc::LOCAL_PEERPID,
+                (&raw mut pid).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(LOCAL_PEERPID) failed");
+        u32::try_from(pid).expect("positive peer pid")
+    }
+}
+
 #[tokio::test]
 async fn unix_sockets_connect_in_writable_grants_and_honor_read_denylist() {
     use std::io::{Read, Write};
@@ -393,8 +434,15 @@ async fn unix_sockets_connect_in_writable_grants_and_honor_read_denylist() {
     let allowed_listener = UnixListener::bind(&allowed_sock).expect("bind allowed socket");
     let _denied_listener = UnixListener::bind(&denied_sock).expect("bind denied socket");
 
+    let host_pid = std::process::id();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = allowed_listener.accept().expect("accept");
+        let peer_pid = unix_peer_pid(&stream);
+        assert!(peer_pid > 0, "peer PID must be non-zero, got {peer_pid}");
+        assert_ne!(
+            peer_pid, host_pid,
+            "peer PID must identify the connecting sandboxed child, not the host broker"
+        );
         let mut buf = [0_u8; 4];
         stream.read_exact(&mut buf).expect("read ping");
         assert_eq!(&buf, b"ping");

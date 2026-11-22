@@ -161,9 +161,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
 
   feature-checks:
     needs: changes
