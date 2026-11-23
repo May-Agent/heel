@@ -25,6 +25,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: water-rs/stow@main
+        if: ${{ !(runner.os == 'Windows' && runner.arch == 'ARM64') }}
 
       - name: Allow unprivileged user namespaces on Ubuntu 24.04
         if: runner.os == 'Linux'
