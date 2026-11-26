@@ -104,11 +104,13 @@ const EINTR: c_int = 4;
 #[cfg(target_os = "linux")]
 const EAGAIN: c_int = 11;
 
-/// `<fcntl.h>` `F_SETFD`, `F_GETFL`, `F_SETFL`, `FD_CLOEXEC`.
+/// `<fcntl.h>` `F_SETFD`, `F_GETFL`, `F_SETFL`, `FD_CLOEXEC`, `F_DUPFD_CLOEXEC`.
 const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const FD_CLOEXEC: c_int = 1;
+#[cfg(target_os = "linux")]
+const F_DUPFD_CLOEXEC: c_int = 1030;
 
 /// `<fcntl.h>` `O_NONBLOCK`.
 #[cfg(target_os = "macos")]
@@ -1720,6 +1722,26 @@ mod supervise_mode {
     }
 }
 
+/// Relocates `fd` to a slot `>= min_fd` with `FD_CLOEXEC` set when `fd < min_fd`
+/// so subsequent `dup2` calls into `0..min_fd` cannot clobber it.
+///
+/// # Safety
+/// Must be called on a uniquely owned descriptor in a single-threaded post-fork child.
+#[cfg(target_os = "linux")]
+unsafe fn relocate_above(fd: RawFd, min_fd: c_int) -> io::Result<RawFd> {
+    if fd >= min_fd {
+        return Ok(fd);
+    }
+    // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` is async-signal-safe and `fd` is open.
+    let moved = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, min_fd) };
+    if moved == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `moved` now references the same file description, so closing `fd` is safe.
+    let _ = unsafe { close(fd) };
+    Ok(moved)
+}
+
 fn handle_spawn(
     cur: &mut Cursor<'_>,
     fds: Vec<OwnedFd>,
@@ -1849,11 +1871,11 @@ fn handle_spawn(
     #[cfg(target_os = "linux")]
     let cred_raw = cred_fd.as_raw_fd();
     #[cfg(target_os = "linux")]
-    let ruleset_raw = ruleset_fd.as_ref().map(AsRawFd::as_raw_fd);
+    let mut ruleset_raw = ruleset_fd.as_ref().map(AsRawFd::as_raw_fd);
     #[cfg(target_os = "linux")]
-    let broker_raw = broker_fd.as_ref().map(AsRawFd::as_raw_fd);
+    let mut broker_raw = broker_fd.as_ref().map(AsRawFd::as_raw_fd);
     #[cfg(target_os = "linux")]
-    let inherit_pairs: Vec<(RawFd, i32)> = extra_fds
+    let mut inherit_pairs: Vec<(RawFd, i32)> = extra_fds
         .iter()
         .map(|(fd, target)| (fd.as_raw_fd(), *target))
         .collect();
@@ -1880,13 +1902,32 @@ fn handle_spawn(
                 attach_pty_in_child(slave_fd)?;
             }
 
-            for &(src_fd, dst_fd) in &inherit_pairs {
-                if src_fd == dst_fd {
-                    if fcntl(dst_fd, F_SETFD, 0) == -1 {
+            // Relocate every descriptor we still need (`ruleset_raw`, `broker_raw`,
+            // and the `inherit_pairs` sources) above the highest target fd before
+            // running `dup2`. Otherwise `dup2(_, 5)` for `--supervise-pty` can
+            // overwrite `ruleset_raw` (causing `landlock_restrict_self` to fail
+            // with `EBADFD`), `broker_raw`, or another inherited source.
+            if !inherit_pairs.is_empty() {
+                let min_safe = inherit_pairs
+                    .iter()
+                    .map(|&(_, dst)| dst)
+                    .max()
+                    .unwrap_or(2)
+                    .saturating_add(1)
+                    .max(3);
+                if let Some(rfd) = ruleset_raw {
+                    ruleset_raw = Some(relocate_above(rfd, min_safe)?);
+                }
+                if let Some(bsock) = broker_raw {
+                    broker_raw = Some(relocate_above(bsock, min_safe)?);
+                }
+                for pair in &mut inherit_pairs {
+                    pair.0 = relocate_above(pair.0, min_safe)?;
+                }
+                for &(src_fd, dst_fd) in &inherit_pairs {
+                    if dup2(src_fd, dst_fd) == -1 {
                         return Err(io::Error::last_os_error());
                     }
-                } else if dup2(src_fd, dst_fd) == -1 {
-                    return Err(io::Error::last_os_error());
                 }
             }
 
