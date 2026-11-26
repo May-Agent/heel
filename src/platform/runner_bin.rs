@@ -19,8 +19,8 @@ use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::ffi::{CString, c_char};
 #[cfg(target_os = "linux")]
-use std::ffi::{c_char, c_long, c_ulong};
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{c_char, c_long};
+use std::ffi::{c_int, c_uint, c_ulong, c_void};
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io::Read;
@@ -122,11 +122,26 @@ const SIGCHLD: c_int = 20;
 #[cfg(target_os = "linux")]
 const SIGCHLD: c_int = 17;
 
+const SIGHUP: c_int = 1;
+const SIGINT: c_int = 2;
+const SIGQUIT: c_int = 3;
 const SIGKILL: c_int = 9;
 const SIGPIPE: c_int = 13;
+#[cfg(target_os = "macos")]
+const SIGTSTP: c_int = 18;
 #[cfg(target_os = "linux")]
 const SIGSTOP: c_int = 19;
+#[cfg(target_os = "linux")]
+const SIGTSTP: c_int = 20;
+const SIGTTIN: c_int = 21;
+const SIGTTOU: c_int = 22;
 const SIG_DFL: usize = 0;
+
+/// `<sys/ttycom.h>` (`_IO('t', 97)`) on Darwin; `<asm-generic/ioctls.h>` on Linux.
+#[cfg(target_os = "macos")]
+const TIOCSCTTY: c_ulong = 0x2000_7461;
+#[cfg(target_os = "linux")]
+const TIOCSCTTY: c_ulong = 0x540E;
 
 #[cfg(target_os = "macos")]
 const SIG_BLOCK: c_int = 1;
@@ -218,6 +233,10 @@ struct SigAction {
 
 unsafe extern "C" {
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
+    fn close(fd: c_int) -> c_int;
+    fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+    fn setsid() -> c_int;
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
@@ -228,10 +247,6 @@ unsafe extern "C" {
     fn sigaction(signum: c_int, act: *const SigAction, oldact: *mut SigAction) -> c_int;
     fn pthread_sigmask(how: c_int, set: *const SigSet, oldset: *mut SigSet) -> c_int;
 
-    #[cfg(target_os = "linux")]
-    fn close(fd: c_int) -> c_int;
-    #[cfg(target_os = "linux")]
-    fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
     #[cfg(target_os = "linux")]
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     #[cfg(target_os = "linux")]
@@ -593,7 +608,7 @@ const fn cmsg_len(data_len: usize) -> Socklen {
 fn recv_packet(sock: RawFd) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
     let mut len_bytes = [0u8; 4];
     let mut fds: Vec<OwnedFd> = Vec::new();
-    let mut cmsg_buf = [0u8; cmsg_space(std::mem::size_of::<RawFd>() * 8)];
+    let mut cmsg_buf = [0u8; cmsg_space(std::mem::size_of::<RawFd>() * 16)];
     let mut read_so_far = 0usize;
 
     while read_so_far < 4 {
@@ -865,6 +880,43 @@ fn stdio_from_mode(mode: u8, fds: &mut std::vec::IntoIter<OwnedFd>) -> io::Resul
     }
 }
 
+/// Start a new session, set `slave_fd` as the controlling terminal, attach it
+/// to stdin/stdout/stderr, and close `slave_fd` if it lies above stdio.
+///
+/// # Safety
+///
+/// Must only be called in a forked child before `exec` (`pre_exec`) where
+/// `slave_fd` is an open PTY slave descriptor and the child is not already a
+/// process group leader.
+unsafe fn attach_pty_in_child(slave_fd: RawFd) -> io::Result<()> {
+    // SAFETY: `signal`, `setsid`, `ioctl`, `dup2`, `fcntl`, and `close` are all
+    // async-signal-safe and allocation-free.
+    unsafe {
+        for sig in [SIGHUP, SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU] {
+            let _ = signal(sig, SIG_DFL);
+        }
+        if setsid() == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if ioctl(slave_fd, TIOCSCTTY, 0 as c_int) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        for target in 0..=2 {
+            if slave_fd == target {
+                if fcntl(target, F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            } else if dup2(slave_fd, target) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if slave_fd > 2 {
+            let _ = close(slave_fd);
+        }
+    }
+    Ok(())
+}
+
 fn apply_limits_and_priority(
     limits: &[(i32, u64)],
     nice: Option<i32>,
@@ -1104,7 +1156,10 @@ mod linux_ns {
             }
             Ok(0) => {
                 // SAFETY: inside PID 1 of the new PID namespace; single-threaded.
+                // `setsid` detaches any inherited host controlling terminal so
+                // piped commands inside the container see `ENXIO` on `/dev/tty`.
                 unsafe {
+                    let _ = setsid();
                     let _ = prctl(PR_SET_PDEATHSIG, SIGKILL as c_ulong, 0, 0, 0);
                     let _ = prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
                 }
@@ -1186,8 +1241,9 @@ mod linux_ns {
             unsafe { _exit(1) };
         }
         if inner == 0 {
-            // SAFETY: inside nested PID 1.
+            // SAFETY: inside nested PID 1; detach any inherited controlling terminal.
             unsafe {
+                let _ = setsid();
                 let _ = prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
             }
             let proc_fd = match mount_private_proc() {
@@ -1430,7 +1486,7 @@ mod supervise_mode {
         }
     }
 
-    pub fn run(mut args: std::env::Args) -> ExitCode {
+    pub fn run(mut args: std::env::Args, with_pty: bool) -> ExitCode {
         let Some(mode) = args.next() else {
             return ExitCode::FAILURE;
         };
@@ -1445,6 +1501,14 @@ mod supervise_mode {
         let Some(cred_fd) = args.next().and_then(|s| s.parse::<RawFd>().ok()) else {
             return ExitCode::FAILURE;
         };
+        let pty_fd = if with_pty {
+            let Some(fd) = args.next().and_then(|s| s.parse::<RawFd>().ok()) else {
+                return ExitCode::FAILURE;
+            };
+            Some(fd)
+        } else {
+            None
+        };
         let Some(reap_ms) = args.next().and_then(|s| s.parse::<u64>().ok()) else {
             return ExitCode::FAILURE;
         };
@@ -1458,10 +1522,15 @@ mod supervise_mode {
 
         let _ = set_cloexec_nonblock(control_fd, true);
         let _ = set_cloexec_nonblock(cred_fd, false);
+        if let Some(fd) = pty_fd {
+            let _ = set_cloexec_nonblock(fd, false);
+        }
         // SAFETY: `control_fd` was inherited specifically for the supervisor control channel.
         let mut control = unsafe { UnixStream::from_raw_fd(control_fd) };
         // SAFETY: `cred_fd` was inherited for announcing the spawned command's host PID.
         let cred_owned = unsafe { OwnedFd::from_raw_fd(cred_fd) };
+        // SAFETY: `pty_fd`, when present, was inherited specifically to attach to the child.
+        let pty_owned = pty_fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
 
         let Ok(original_mask) = block_sigchld() else {
             return ExitCode::FAILURE;
@@ -1477,15 +1546,27 @@ mod supervise_mode {
         };
 
         let cred_raw = cred_owned.as_raw_fd();
+        let pty_raw = pty_owned.as_ref().map(AsRawFd::as_raw_fd);
         let mut cmd = Command::new(&program);
-        cmd.args(&cmd_args).process_group(0);
-        // SAFETY: `pre_exec` only calls async-signal-safe `pthread_sigmask`, `write`, and `close`.
+        cmd.args(&cmd_args);
+        if pty_raw.is_none() {
+            cmd.process_group(0);
+        } else {
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        }
+        // SAFETY: `pre_exec` only calls async-signal-safe `pthread_sigmask`,
+        // `attach_pty_in_child`, `write`, and `close`.
         unsafe {
             cmd.pre_exec(move || {
                 let rc =
                     pthread_sigmask(SIG_SETMASK, &raw const original_mask, std::ptr::null_mut());
                 if rc != 0 {
                     return Err(io::Error::from_raw_os_error(rc));
+                }
+                if let Some(slave_fd) = pty_raw {
+                    attach_pty_in_child(slave_fd)?;
                 }
                 let b = 1u8;
                 if write(cred_raw, (&raw const b).cast(), 1) != 1 {
@@ -1499,7 +1580,7 @@ mod supervise_mode {
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(err) => {
-                drop(cred_owned);
+                drop((cred_owned, pty_owned));
                 let os_err = match err.raw_os_error() {
                     Some(c) => c.to_string(),
                     None => "null".to_owned(),
@@ -1513,7 +1594,9 @@ mod supervise_mode {
                 return ExitCode::FAILURE;
             }
         };
-        drop(cred_owned);
+        // Close the supervisor's copies immediately so the child owns the sole
+        // slave reference and the host sees EOF/EIO when the child exits.
+        drop((cred_owned, pty_owned));
         let cmd_pid = child.id();
         std::mem::forget(child);
 
@@ -1667,6 +1750,7 @@ fn handle_spawn(
     }
     let nice = cur.opt_i32()?;
     let io_policy = cur.opt_i32()?;
+    let is_pty = cur.u8()? != 0;
 
     #[cfg(target_os = "linux")]
     let (has_ruleset, notif_prog, filter_progs, extra_targets) = {
@@ -1694,6 +1778,14 @@ fn handle_spawn(
     let stdin_cfg = stdio_from_mode(stdin_mode, &mut fd_iter)?;
     let stdout_cfg = stdio_from_mode(stdout_mode, &mut fd_iter)?;
     let stderr_cfg = stdio_from_mode(stderr_mode, &mut fd_iter)?;
+    let pty_slave = if is_pty {
+        Some(fd_iter.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing PTY slave fd")
+        })?)
+    } else {
+        None
+    };
+    let pty_slave_raw = pty_slave.as_ref().map(AsRawFd::as_raw_fd);
 
     #[cfg(target_os = "linux")]
     let (cred_fd, ruleset_fd, broker_fd, extra_fds) = {
@@ -1731,11 +1823,14 @@ fn handle_spawn(
         .envs(envs)
         .stdin(stdin_cfg)
         .stdout(stdout_cfg)
-        .stderr(stderr_cfg)
-        .process_group(0);
+        .stderr(stderr_cfg);
+    if !is_pty {
+        cmd.process_group(0);
+    }
 
     #[cfg(target_os = "macos")]
-    // SAFETY: `pre_exec` runs in the forked child before `exec` using async-signal-safe calls.
+    // SAFETY: `pre_exec` runs in the forked child before `exec` inside this
+    // single-threaded runner and only issues async-signal-safe syscalls.
     unsafe {
         cmd.pre_exec(move || {
             let rc = pthread_sigmask(SIG_SETMASK, &raw const original_mask, std::ptr::null_mut());
@@ -1744,6 +1839,9 @@ fn handle_spawn(
             }
             let _ = signal(SIGCHLD, SIG_DFL);
             let _ = signal(SIGPIPE, SIG_DFL);
+            if let Some(slave_fd) = pty_slave_raw {
+                attach_pty_in_child(slave_fd)?;
+            }
             apply_limits_and_priority(&limits, nice, io_policy)
         });
     }
@@ -1777,6 +1875,10 @@ fn handle_spawn(
                 return Err(io::Error::last_os_error());
             }
             let _ = close(cred_raw);
+
+            if let Some(slave_fd) = pty_slave_raw {
+                attach_pty_in_child(slave_fd)?;
+            }
 
             for &(src_fd, dst_fd) in &inherit_pairs {
                 if src_fd == dst_fd {
@@ -1853,6 +1955,7 @@ fn handle_spawn(
     }
 
     let spawned = cmd.spawn();
+    drop(pty_slave);
     #[cfg(target_os = "linux")]
     drop((cred_fd, ruleset_fd, broker_fd, extra_fds));
 
@@ -2051,7 +2154,11 @@ fn main() -> ExitCode {
 
     #[cfg(target_os = "linux")]
     if first == "--supervise" {
-        return supervise_mode::run(args);
+        return supervise_mode::run(args, false);
+    }
+    #[cfg(target_os = "linux")]
+    if first == "--supervise-pty" {
+        return supervise_mode::run(args, true);
     }
 
     let Ok(raw_fd) = first.parse::<RawFd>() else {

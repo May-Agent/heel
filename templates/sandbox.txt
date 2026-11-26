@@ -138,17 +138,17 @@
 (allow file-read* (literal "/dev/urandom"))
 (allow file-read* (subpath "/dev/fd"))
 (allow file-read* (literal "/dev/tty"))
-(allow file-read* (regex #"^/dev/ttys[0-9]+$"))
-(allow file-read* (regex #"^/dev/pty[pq][0-9a-f]+$"))
+(allow file-write* (literal "/dev/tty"))
+(allow file-ioctl (literal "/dev/tty"))
 (allow file-write* (literal "/dev/null"))
 (allow file-write* (literal "/dev/zero"))
 (allow file-write* (subpath "/dev/fd"))
 {% if allow_tty_write %}
 ; TTY write access enabled (for interactive sessions)
-(allow file-write* (literal "/dev/tty"))
+(allow file-read* (regex #"^/dev/ttys[0-9]+$"))
+(allow file-read* (regex #"^/dev/pty[pq][0-9a-f]+$"))
 (allow file-write* (regex #"^/dev/ttys[0-9]+$"))
 (allow file-write* (regex #"^/dev/pty[pq][0-9a-f]+$"))
-(allow file-ioctl (literal "/dev/tty"))
 (allow file-ioctl (regex #"^/dev/ttys[0-9]+$"))
 (allow file-ioctl (regex #"^/dev/pty[pq][0-9a-f]+$"))
 {% endif %}
@@ -160,6 +160,27 @@
 ; matches "/.ssh/" and a trailing "/.ssh" but not "not.ssh.txt". The protections
 ; of the credential toggles are in pass 4.
 ; =============================================================================
+
+{% if !allow_tty_write %}
+; --- Terminal device isolation ---
+; Deny opening or writing other processes' terminal devices (host PTYs and
+; sibling commands' slave PTYs). `file-read-metadata` stays permitted so
+; `ttyname(3)` / `tty(1)` can stat a child's own inherited slave path, and
+; `file-ioctl` stays permitted on `/dev/ttysNNN` so a PTY child can issue
+; termios/winsize ioctls (`tcsetattr`, `TIOCGWINSZ`, `TIOCSCTTY`) on its
+; host-passed slave descriptors; because `open(2)` is denied for every mode
+; (`file-read-data` and `file-write*`), no sibling can obtain a descriptor
+; to another command's or the host's `/dev/ttysNNN` to issue an ioctl on it.
+; macOS Seatbelt attaches consumed `sandbox_extension` handles to the shared
+; `sandbox_t` rather than per process, so per-child file extensions cannot
+; isolate sibling commands inside one persistent runner.
+(deny file-read-data (regex #"^/dev/ttys[0-9]+$") {{ audit }})
+(deny file-read-data (regex #"^/dev/pty[pq][0-9a-f]+$") {{ audit }})
+(deny file-write* (regex #"^/dev/ttys[0-9]+$") {{ audit }})
+(deny file-write* (regex #"^/dev/pty[pq][0-9a-f]+$") {{ audit }})
+(deny file-ioctl (regex #"^/dev/pty[pq][0-9a-f]+$") {{ audit }})
+(allow file-ioctl (regex #"^/dev/ttys[0-9]+$"))
+{% endif %}
 
 ; --- No exec from anywhere the sandboxed process can write ---
 ; Without these, the baseline exec allow above would let sandboxed code write a

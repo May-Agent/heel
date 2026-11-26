@@ -455,6 +455,35 @@ fn open_write(
                 if flags & libc::O_ACCMODE as u32 == libc::O_RDWR as u32 && g.read_denied(&target) {
                     return Err(refuse(ctx, call, Operation::ReadData, &target));
                 }
+                if is(&stat, FileType::CharacterDevice) {
+                    let rdev = stat.st_rdev;
+                    if (libc::major(rdev), libc::minor(rdev)) == DEV_TTY
+                        || shared.pty_slave_inode() == Some(identity(&stat))
+                    {
+                        // Let the kernel open `/dev/tty` in the caller's own
+                        // session context (resolving to its controlling
+                        // terminal or `ENXIO`) or open this command's own PTY
+                        // slave directly. The child's Landlock ruleset strips
+                        // write rights from every non-TTY inode, so a racing
+                        // symlink swap to another file is rejected by Landlock.
+                        return Ok(Reply::Continue);
+                    }
+                }
+                if place.in_proc
+                    && is(&stat, FileType::Symlink)
+                    && let Some(slave_inode) = shared.pty_slave_inode()
+                    && let Ok(followed) =
+                        rustix::fs::statat(&place.parent, place.kernel_name(), AtFlags::empty())
+                    && is(&followed, FileType::CharacterDevice)
+                    && identity(&followed) == slave_inode
+                {
+                    // `/dev/fd/N` and `/proc/self/fd/N` pointing at this
+                    // command's own PTY slave: continue in the caller so the
+                    // kernel opens the slave under the write-stripped Landlock
+                    // ruleset (which permits writes only on `/dev/tty` and this
+                    // command's slave inode).
+                    return Ok(Reply::Continue);
+                }
                 if !g.can_write(&target) {
                     return Err(EACCES);
                 }

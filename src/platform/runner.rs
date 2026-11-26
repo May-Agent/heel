@@ -196,13 +196,17 @@ impl Runner {
             .arg(fd_num.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
 
-        // SAFETY: clears `FD_CLOEXEC` on `fd_num` and applies `setrlimit`,
-        // `setpriority` and `setiopolicy_np` before `sandbox-exec` enters Seatbelt.
+        // SAFETY: detaches any inherited host controlling terminal via `setsid`
+        // (which also creates a process group `pgid == pid` for `shutdown`),
+        // clears `FD_CLOEXEC` on `fd_num`, and applies limits and priority
+        // before `sandbox-exec` enters Seatbelt.
         unsafe {
             cmd.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
                 if libc::fcntl(fd_num, libc::F_SETFD, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -522,11 +526,24 @@ impl Runner {
         limits: &[(i32, u64)],
         nice: Option<i32>,
         io_policy: Option<i32>,
+        pty_slave_fd: Option<RawFd>,
         #[cfg(target_os = "linux")] linux_extra: LinuxSpawnExtra<'_>,
     ) -> io::Result<RunnerChild> {
-        let (stdin_mode, host_stdin, child_stdin) = prepare_stdio(stdin_cfg, 0)?;
-        let (stdout_mode, host_stdout, child_stdout) = prepare_stdio(stdout_cfg, 1)?;
-        let (stderr_mode, host_stderr, child_stderr) = prepare_stdio(stderr_cfg, 2)?;
+        let (stdin_mode, host_stdin, child_stdin) = if pty_slave_fd.is_some() {
+            (STDIO_NULL, None, None)
+        } else {
+            prepare_stdio(stdin_cfg, 0)?
+        };
+        let (stdout_mode, host_stdout, child_stdout) = if pty_slave_fd.is_some() {
+            (STDIO_NULL, None, None)
+        } else {
+            prepare_stdio(stdout_cfg, 1)?
+        };
+        let (stderr_mode, host_stderr, child_stderr) = if pty_slave_fd.is_some() {
+            (STDIO_NULL, None, None)
+        } else {
+            prepare_stdio(stderr_cfg, 2)?
+        };
 
         let req_id = self.alloc_id();
         let mut buf = Vec::with_capacity(256);
@@ -553,8 +570,9 @@ impl Runner {
         }
         push_opt_i32(&mut buf, nice);
         push_opt_i32(&mut buf, io_policy);
+        buf.push(u8::from(pty_slave_fd.is_some()));
 
-        let mut fds_to_send: Vec<RawFd> = Vec::with_capacity(7);
+        let mut fds_to_send: Vec<RawFd> = Vec::with_capacity(8);
         if let Some(fd) = &child_stdin {
             fds_to_send.push(fd.as_raw_fd());
         }
@@ -563,6 +581,9 @@ impl Runner {
         }
         if let Some(fd) = &child_stderr {
             fds_to_send.push(fd.as_raw_fd());
+        }
+        if let Some(slave_fd) = pty_slave_fd {
+            fds_to_send.push(slave_fd);
         }
 
         #[cfg(target_os = "linux")]
@@ -612,7 +633,7 @@ impl Runner {
             let reply = self.mailbox.wait_reply(req_id)?;
             return match reply {
                 Reply::SpawnOk(sandbox_pid) => {
-                    broker.accept_listener(listener_parent)?;
+                    broker.accept_listener(listener_parent, linux_extra.pty_slave_inode)?;
                     let host_pid = read_cred_pid(&cred_read)?;
                     Ok(RunnerChild {
                         runner: Arc::clone(self),
@@ -744,6 +765,7 @@ pub(crate) struct LinuxSpawnExtra<'a> {
     pub broker_child_sock: Option<OwnedFd>,
     pub broker_handoff: Option<(&'a crate::platform::linux::broker::Broker, OwnedFd)>,
     pub inherit_fds: &'a [(RawFd, i32)],
+    pub pty_slave_inode: Option<(u64, u64)>,
 }
 
 /// Process handle backed by a persistent [`Runner`].

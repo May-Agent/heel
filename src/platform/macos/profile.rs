@@ -1451,6 +1451,19 @@ mod tests {
     }
 
     #[test]
+    fn default_profile_allows_dev_tty_and_isolates_pty_slaves() {
+        let (data, _dir) = prepared_config(SandboxConfig::new());
+        let profile = generate_profile(&data, None).unwrap();
+
+        assert!(profile.contains("(allow file-write* (literal \"/dev/tty\"))"));
+        assert!(profile.contains("(allow file-ioctl (literal \"/dev/tty\"))"));
+        assert!(profile.contains("(deny file-read-data (regex #\"^/dev/ttys[0-9]+$\")"));
+        assert!(profile.contains("(deny file-write* (regex #\"^/dev/ttys[0-9]+$\")"));
+        assert!(profile.contains("(deny file-ioctl (regex #\"^/dev/pty[pq][0-9a-f]+$\")"));
+        assert!(profile.contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))"));
+    }
+
+    #[test]
     fn generated_profile_allows_ephemeral_loopback_server() {
         let (data, _dir) = prepared_config(SandboxConfig::new());
         let profile = generate_profile(&data, None).unwrap();

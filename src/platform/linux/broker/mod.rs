@@ -65,7 +65,7 @@ use crate::platform::linux::landlock_rules::{
     self, Carved, Planned, PreparedRuleset, REQUIRED_ABI, without_writes,
 };
 
-use check::Guard;
+use check::{Guard, InodeId};
 use diag::Diagnostic;
 use filter::Coverage;
 use pool::{Pool, PoolPlan};
@@ -79,6 +79,7 @@ enum LauncherJob {
     Accept {
         listener_socket: OwnedFd,
         guard: Arc<Guard>,
+        pty_slave_inode: Option<InodeId>,
         reply: SyncSender<io::Result<()>>,
     },
     GrantPool {
@@ -95,6 +96,10 @@ pub(crate) struct Broker {
     jobs: Sender<LauncherJob>,
     /// Current policy guard snapshot cloned into each newly spawned command.
     guard: RwLock<Arc<Guard>>,
+    /// Cached read-only Landlock ruleset plan used to instantiate isolated
+    /// per-command rulesets (for example, PTY commands granted only their own
+    /// slave inode) without mutating the shared ruleset or re-carving.
+    sandbox_rules: RwLock<Vec<Planned>>,
     /// Directories holding pre-created inode pools, preserved across policy updates.
     pool_dirs: Vec<PathBuf>,
     denylists: bool,
@@ -256,7 +261,8 @@ impl Broker {
         check_ptrace_scope()?;
 
         let abi = REQUIRED_ABI;
-        let (sandbox_ruleset, guard, pool, pool_dirs, held, coverage) = if denylists {
+        let (sandbox_ruleset, sandbox_rules, guard, pool, pool_dirs, held, coverage) = if denylists
+        {
             let plan = landlock_rules::plan(config);
             let (prepared, held) = prepare_on_a_thread(config, &plan, abi)?;
             let Prepared {
@@ -267,6 +273,7 @@ impl Broker {
             let pool_dirs = pool.as_ref().map_or_else(Vec::new, PoolPlan::directories);
             let sandbox_rules = without_writes(&carved.rules, abi);
             let mut sandbox_ruleset = landlock_rules::instantiate(&sandbox_rules, proxy_port, abi)?;
+            sandbox_ruleset.grant_dev_tty()?;
             let reads = landlock_rules::read_rights(abi);
             if let Some(pool) = &pool {
                 pool.grant(&held, &mut |fd, access| {
@@ -282,12 +289,21 @@ impl Broker {
                 files: true,
                 reads: guard.watches_reads(),
             };
-            (sandbox_ruleset, guard, pool, pool_dirs, held, coverage)
+            (
+                sandbox_ruleset,
+                sandbox_rules,
+                guard,
+                pool,
+                pool_dirs,
+                held,
+                coverage,
+            )
         } else {
             let plan = landlock_rules::plan(config);
             let guard = Guard::new(config, &plan, HashSet::new(), Vec::new())?;
             (
                 landlock_rules::instantiate(&plan, proxy_port, abi)?,
+                plan,
                 guard,
                 None,
                 Vec::new(),
@@ -304,6 +320,7 @@ impl Broker {
         let diagnostics =
             diag::start().map_err(init("cannot start the broker's diagnostics thread"))?;
         let guard = RwLock::new(Arc::new(guard));
+        let sandbox_rules = RwLock::new(sandbox_rules);
         let (jobs, queue) = channel();
         let (home_commands, home_rx) = channel();
         let (ready, started) = sync_channel(1);
@@ -334,11 +351,39 @@ impl Broker {
                 program_bytes,
                 jobs,
                 guard,
+                sandbox_rules,
                 pool_dirs,
                 denylists,
             },
             sandbox_ruleset,
         )))
+    }
+
+    /// Build a fresh Landlock ruleset matching this broker's current policy,
+    /// without mutating the sandbox's shared ruleset.
+    pub(crate) fn build_command_ruleset(&self, proxy_port: Option<u16>) -> Result<PreparedRuleset> {
+        let abi = REQUIRED_ABI;
+        let rules = self
+            .sandbox_rules
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut ruleset = landlock_rules::instantiate(&rules, proxy_port, abi)?;
+        if self.denylists {
+            ruleset.grant_dev_tty()?;
+            let ruleset_fd = ruleset.duplicate_fd()?;
+            let (reply_tx, reply_rx) = channel();
+            self.jobs
+                .send(LauncherJob::GrantPool {
+                    ruleset_fd,
+                    reply: reply_tx,
+                })
+                .map_err(|_| Error::InitFailed("the broker's launcher exited".to_owned()))?;
+            reply_rx
+                .recv()
+                .map_err(|_| Error::InitFailed("the broker's home thread exited".to_owned()))??;
+        }
+        Ok(ruleset)
     }
 
     /// Raw `sock_filter` bytes of the seccomp notification filter.
@@ -371,13 +416,18 @@ impl Broker {
 
     /// Receive a seccomp listener from `listener_socket` and start serving it
     /// under a launch-time snapshot of the current policy guard.
-    pub(crate) fn accept_listener(&self, listener_socket: OwnedFd) -> io::Result<()> {
+    pub(crate) fn accept_listener(
+        &self,
+        listener_socket: OwnedFd,
+        pty_slave_inode: Option<InodeId>,
+    ) -> io::Result<()> {
         let guard = Arc::clone(&self.guard.read().unwrap_or_else(PoisonError::into_inner));
         let (reply, result) = sync_channel(1);
         self.jobs
             .send(LauncherJob::Accept {
                 listener_socket,
                 guard,
+                pty_slave_inode,
                 reply,
             })
             .map_err(|_| io::Error::other("the broker's launcher exited"))?;
@@ -399,6 +449,10 @@ impl Broker {
         if !self.denylists {
             let new_guard = Guard::new(config, &plan, HashSet::new(), Vec::new())?;
             let ruleset = landlock_rules::build_ruleset(config, proxy_port)?;
+            *self
+                .sandbox_rules
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = plan;
             *self.guard.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(new_guard);
             return Ok(ruleset);
         }
@@ -427,7 +481,8 @@ impl Broker {
         })?;
         let (carved, new_guard) = outcome?;
         let sandbox_rules = without_writes(&carved.rules, abi);
-        let ruleset = landlock_rules::instantiate(&sandbox_rules, proxy_port, abi)?;
+        let mut ruleset = landlock_rules::instantiate(&sandbox_rules, proxy_port, abi)?;
+        ruleset.grant_dev_tty()?;
         let ruleset_fd = ruleset.duplicate_fd()?;
         let (reply_tx, reply_rx) = channel();
         self.jobs
@@ -443,6 +498,10 @@ impl Broker {
             files: true,
             reads: new_guard.watches_reads(),
         })?;
+        *self
+            .sandbox_rules
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = sandbox_rules;
         *self
             .program_bytes
             .write()
@@ -510,13 +569,17 @@ fn start_home(launch: Launch) -> io::Result<HomeLink> {
 fn hand_over_listener(
     home: &HomeLink,
     guard: Arc<Guard>,
+    pty_slave_inode: Option<InodeId>,
     listener_socket: &OwnedFd,
 ) -> io::Result<()> {
     let listener = table::recv_fds(listener_socket.as_fd())?.ok_or_else(|| {
         io::Error::other("the sandboxed process ended before it handed over its listener")
     })?;
     home.commands
-        .send(home::HomeCommand::Adopt { guard })
+        .send(home::HomeCommand::Adopt {
+            guard,
+            pty_slave_inode,
+        })
         .map_err(|_| io::Error::other("the broker's home thread ended"))?;
     let borrowed: Vec<BorrowedFd<'_>> = listener.iter().map(AsFd::as_fd).collect();
     table::send_fds(home.socket.as_fd(), &borrowed)?;
@@ -544,9 +607,10 @@ fn launcher(launch: Launch, queue: &Receiver<LauncherJob>, ready: &SyncSender<io
             LauncherJob::Accept {
                 listener_socket,
                 guard,
+                pty_slave_inode,
                 reply,
             } => {
-                let outcome = hand_over_listener(&home, guard, &listener_socket);
+                let outcome = hand_over_listener(&home, guard, pty_slave_inode, &listener_socket);
                 let _ = reply.send(outcome);
             }
             LauncherJob::GrantPool { ruleset_fd, reply } => {

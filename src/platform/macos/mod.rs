@@ -6,8 +6,9 @@ mod profile;
 pub use profile::generate_profile;
 
 use std::collections::BTreeSet;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
 use crate::config::SandboxConfigData;
@@ -15,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::grant::Grant;
 use crate::platform::child::unix::UnixChild;
 use crate::platform::preexec::PreExecSetup;
+use crate::platform::pty::{AllocatedPty, PtyMaster, attach_slave_in_child};
 use crate::platform::runner::{
     Runner, SandboxHandle, StagedRunner, issue_macos_deny_read, issue_macos_extension,
 };
@@ -204,7 +206,11 @@ impl MacOSBackend {
     }
 
     /// Turn a host-access spawn request into a direct `sandbox-exec` invocation.
-    fn build_host_command(&self, request: &SpawnRequest<'_>) -> Result<Command> {
+    fn build_host_command(
+        &self,
+        request: &SpawnRequest<'_>,
+        with_preexec: bool,
+    ) -> Result<Command> {
         let mut cmd = Command::new(SANDBOX_EXEC);
         cmd.arg("-p").arg(&self.profile);
         cmd.arg(request.program);
@@ -216,12 +222,14 @@ impl MacOSBackend {
             cmd.env(key, value);
         }
 
-        let setup = PreExecSetup::new(request.config)?;
-        if !setup.is_empty() {
-            // SAFETY: the closure only issues `setrlimit`, `setpriority` and
-            // `setiopolicy_np`, which are async-signal-safe and allocation-free.
-            unsafe {
-                cmd.pre_exec(move || setup.apply());
+        if with_preexec {
+            let setup = PreExecSetup::new(request.config)?;
+            if !setup.is_empty() {
+                // SAFETY: the closure only issues `setrlimit`, `setpriority` and
+                // `setiopolicy_np`, which are async-signal-safe and allocation-free.
+                unsafe {
+                    cmd.pre_exec(move || setup.apply());
+                }
             }
         }
 
@@ -244,17 +252,64 @@ impl MacOSBackend {
                 &[],
                 None,
                 None,
+                None,
             )?;
             return Ok(Child::new(UnixChild::from_runner(child)));
         }
 
-        let mut cmd = self.build_host_command(request)?;
-        cmd.stdin(std::process::Stdio::from(request.stdin));
-        cmd.stdout(std::process::Stdio::from(request.stdout));
-        cmd.stderr(std::process::Stdio::from(request.stderr));
+        let mut cmd = self.build_host_command(request, true)?;
+        cmd.stdin(Stdio::from(request.stdin));
+        cmd.stdout(Stdio::from(request.stdout));
+        cmd.stderr(Stdio::from(request.stderr));
         cmd.process_group(0);
         let child = cmd.spawn()?;
         Ok(Child::new(UnixChild::new(child)))
+    }
+
+    fn spawn_pty_sync(
+        &self,
+        request: &SpawnRequest<'_>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(Child, PtyMaster)> {
+        let pty = AllocatedPty::open(cols, rows)?;
+
+        if let Some(runner) = &self.runner {
+            let envs = merged_envs(request.config, request.envs);
+            let child = runner.spawn_command(
+                request.program,
+                request.args,
+                &envs,
+                request.working_dir(),
+                request.stdin,
+                request.stdout,
+                request.stderr,
+                &[],
+                None,
+                None,
+                Some(pty.slave.as_raw_fd()),
+            )?;
+            drop(pty.slave);
+            return Ok((Child::new(UnixChild::from_runner(child)), pty.master));
+        }
+
+        let mut cmd = self.build_host_command(request, false)?;
+        let setup = PreExecSetup::new(request.config)?;
+        let slave_raw = pty.slave.as_raw_fd();
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: `pre_exec` runs in the forked child before `exec` and only
+        // issues async-signal-safe PTY attachment and limit/priority syscalls.
+        unsafe {
+            cmd.pre_exec(move || {
+                attach_slave_in_child(slave_raw)?;
+                setup.apply()
+            });
+        }
+        let child = cmd.spawn()?;
+        drop(pty.slave);
+        Ok((Child::new(UnixChild::new(child)), pty.master))
     }
 }
 
@@ -294,6 +349,26 @@ impl Backend for MacOSBackend {
         tracing::debug!(program = %request.program, pid = child.id(), "sandbox: spawned");
 
         Ok(child)
+    }
+
+    async fn spawn_pty(
+        &self,
+        request: SpawnRequest<'_>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(Child, PtyMaster)> {
+        tracing::debug!(
+            program = %request.program,
+            args = ?request.args,
+            cols,
+            rows,
+            "sandbox: spawning PTY"
+        );
+
+        let (child, master) = self.spawn_pty_sync(&request, cols, rows)?;
+        tracing::debug!(program = %request.program, pid = child.id(), "sandbox: spawned PTY");
+
+        Ok((child, master))
     }
 }
 

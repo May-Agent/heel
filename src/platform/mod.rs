@@ -7,6 +7,7 @@ use crate::command::StdioConfig;
 use crate::config::SandboxConfigData;
 use crate::error::Result;
 pub use child::Child;
+pub use pty::PtyMaster;
 
 /// Whether two environment variable names are equal under host rules.
 ///
@@ -32,6 +33,8 @@ pub mod macos;
 pub mod linux;
 
 pub(crate) mod child;
+
+pub(crate) mod pty;
 
 pub(crate) mod unresolved;
 
@@ -84,6 +87,14 @@ pub(crate) struct SpawnRequest<'a> {
     /// Descriptors `(host_fd, child_target_fd)` inherited across `exec`.
     #[cfg(target_os = "linux")]
     pub inherit_fds: &'a [(std::os::fd::RawFd, i32)],
+    /// PTY slave descriptor to grant via per-command Landlock `add_inode` when
+    /// spawning a supervised PTY child.
+    #[cfg(target_os = "linux")]
+    pub pty_slave_fd: Option<std::os::fd::BorrowedFd<'a>>,
+    /// Device and inode `(st_dev, st_ino)` of the PTY slave for per-command
+    /// broker authorization.
+    #[cfg(target_os = "linux")]
+    pub pty_slave_inode: Option<(u64, u64)>,
 }
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]
@@ -101,6 +112,15 @@ pub(crate) trait Backend: Sized + Send + Sync {
 
     /// Spawn a command as a child process.
     fn spawn(&self, request: SpawnRequest<'_>) -> impl Future<Output = Result<Child>> + Send;
+
+    /// Spawn a command attached to a freshly allocated pseudo-terminal with
+    /// initial `(cols, rows)` dimensions.
+    fn spawn_pty(
+        &self,
+        request: SpawnRequest<'_>,
+        cols: u16,
+        rows: u16,
+    ) -> impl Future<Output = Result<(Child, PtyMaster)>> + Send;
 }
 
 /// The backend for the current platform.

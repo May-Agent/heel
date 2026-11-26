@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use super::check::Guard;
+use super::check::{Guard, InodeId};
 use super::diag::{Diagnostic, Outbox};
 use super::filter::{self, Syscall};
 use super::notify::{Listener, Reply};
@@ -50,6 +50,7 @@ pub(crate) struct Home {
 #[derive(Debug)]
 pub(crate) struct Shared {
     guard: Arc<Guard>,
+    pty_slave_inode: Option<InodeId>,
     home: Arc<Home>,
 }
 
@@ -75,6 +76,11 @@ impl Shared {
     /// Launch-time policy guard for this command tree.
     pub(crate) fn guard(&self) -> &Guard {
         &self.guard
+    }
+
+    /// Device and inode of this command's own PTY slave, when spawned with a PTY.
+    pub(crate) fn pty_slave_inode(&self) -> Option<InodeId> {
+        self.pty_slave_inode
     }
 
     /// Lock for serving `syscall`.
@@ -297,6 +303,7 @@ fn wait_connect_settled(tid: u32, connect_nr: i64) {
 pub(super) enum HomeCommand {
     Adopt {
         guard: Arc<Guard>,
+        pty_slave_inode: Option<InodeId>,
     },
     GrantPool {
         reply: Sender<crate::error::Result<()>>,
@@ -342,6 +349,7 @@ fn build(socket: &OwnedFd, setup: &mut Setup) -> io::Result<Arc<Home>> {
 fn adopt(
     home: &Arc<Home>,
     guard: Arc<Guard>,
+    pty_slave_inode: Option<InodeId>,
     listener: Vec<OwnedFd>,
     workers: usize,
 ) -> io::Result<()> {
@@ -353,6 +361,7 @@ fn adopt(
     }
     let shared = Arc::new(Shared {
         guard,
+        pty_slave_inode,
         home: Arc::clone(home),
     });
     let serving = Arc::new(Serving {
@@ -384,9 +393,13 @@ pub(super) fn run(socket: &OwnedFd, mut setup: Setup, acknowledge: &Sender<io::R
     let reads = crate::platform::linux::landlock_rules::read_rights(abi);
     while let Ok(command) = setup.commands.recv() {
         match command {
-            HomeCommand::Adopt { guard } => match table::recv_fds(socket.as_fd()) {
+            HomeCommand::Adopt {
+                guard,
+                pty_slave_inode,
+            } => match table::recv_fds(socket.as_fd()) {
                 Ok(Some(listener)) => {
-                    let _ = acknowledge.send(adopt(&home, guard, listener, workers));
+                    let _ =
+                        acknowledge.send(adopt(&home, guard, pty_slave_inode, listener, workers));
                 }
                 Ok(None) => return,
                 Err(error) => {

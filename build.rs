@@ -128,7 +128,10 @@ fn build_checkout(
         .arg(shim_dir.join("Cargo.toml"))
         .args(["--bin", OUTPUT_NAME, "--locked", "--target", target])
         .arg("--target-dir")
-        .arg(&target_dir);
+        .arg(&target_dir)
+        // Override any global `build.build-dir` so this nested Cargo does not
+        // deadlock on the outer workspace's build-dir lock.
+        .env("CARGO_BUILD_BUILD_DIR", &target_dir);
     if release {
         cargo.arg("--release");
     }
@@ -222,6 +225,7 @@ fn fetch(out_dir: &Path, target: &str, executable: &str) -> Result<PathBuf, Stri
 /// Build the published crate of this shim version.
 fn install(out_dir: &Path, target: &str, executable: &str) -> Result<PathBuf, String> {
     let root = out_dir.join("shim-install");
+    let install_build_dir = out_dir.join("shim-install-build");
     let mut cargo = cargo();
     cargo
         .arg("install")
@@ -232,7 +236,10 @@ fn install(out_dir: &Path, target: &str, executable: &str) -> Result<PathBuf, St
         .arg("--root")
         .arg(&root)
         .arg("--target-dir")
-        .arg(out_dir.join("shim-install-build"));
+        .arg(&install_build_dir)
+        // Override any global `build.build-dir` so this nested Cargo does not
+        // deadlock on the outer workspace's build-dir lock.
+        .env("CARGO_BUILD_BUILD_DIR", &install_build_dir);
     run(cargo)?;
     Ok(root.join("bin").join(executable))
 }
@@ -241,8 +248,10 @@ fn install(out_dir: &Path, target: &str, executable: &str) -> Result<PathBuf, St
 fn cargo() -> Command {
     let mut cargo = Command::new(required_env("CARGO"));
     // A lint wrapper the outer build runs over this package's crates must not
-    // run over the executable that is embedded into them.
+    // run over the executable that is embedded into them, and the outer build's
+    // `OUT_DIR` must not leak into nested Cargo / wrapper invocations.
     cargo.env_remove("RUSTC_WORKSPACE_WRAPPER");
+    cargo.env_remove("OUT_DIR");
     cargo
 }
 

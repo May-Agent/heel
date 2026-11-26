@@ -4,17 +4,19 @@ pub(crate) mod broker;
 mod landlock_rules;
 mod seccomp_filter;
 
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Command, Output};
-use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::grant::{Access, Grant};
 use crate::platform::child::unix::UnixChild;
 use crate::platform::preexec::PreExecSetup;
-use crate::platform::runner::{LinuxSpawnExtra, Runner, SandboxHandle};
+use crate::platform::pty::{AllocatedPty, PtyMaster, attach_slave_in_child};
+use crate::platform::runner::{LinuxSpawnExtra, Runner, SandboxHandle, StagedRunner};
 use crate::platform::{Backend, Child, SpawnRequest};
 use crate::resolve::ResolvedPath;
 
@@ -37,6 +39,9 @@ struct LiveRules {
 pub struct LinuxBackend {
     /// Persistent in-namespace PID 1 runner (`None` under `host_access`).
     runner: Option<Arc<Runner>>,
+    /// Lazily staged `heel-unix-runner` used by supervised PTY spawns under
+    /// `host_access`, keeping wire compatibility with external `heel` binaries.
+    host_runner: Mutex<Option<StagedRunner>>,
     /// The broker, when the configuration needs one.
     broker: Option<broker::Broker>,
     /// Live configuration and Landlock ruleset (`None` under `host_access`).
@@ -98,6 +103,7 @@ impl LinuxBackend {
             tracing::info!("Linux sandbox backend initialized (host access)");
             return Ok(Self {
                 runner: None,
+                host_runner: Mutex::new(None),
                 broker: None,
                 live: None,
                 seccomp_filters: Vec::new(),
@@ -149,6 +155,7 @@ impl LinuxBackend {
         tracing::info!(%kernel, broker = broker.is_some(), "Linux sandbox backend initialized");
         Ok(Self {
             runner: Some(runner),
+            host_runner: Mutex::new(None),
             broker,
             live: Some(RwLock::new(LiveRules {
                 internal_grants,
@@ -172,6 +179,22 @@ impl LinuxBackend {
     /// Path of the staged `heel-unix-runner` executable, when confined.
     pub(crate) fn runner_executable(&self) -> Option<&Path> {
         self.runner.as_deref().and_then(Runner::runner_executable)
+    }
+
+    /// Lazily stage the embedded `heel-unix-runner` for supervised PTY spawns
+    /// under `host_access` mode.
+    pub(crate) fn host_runner_executable(&self) -> Result<PathBuf> {
+        let mut slot = self
+            .host_runner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(staged) = slot.as_ref() {
+            return Ok(staged.path().to_path_buf());
+        }
+        let staged = StagedRunner::create()?;
+        let path = staged.path().to_path_buf();
+        *slot = Some(staged);
+        Ok(path)
     }
 
     /// Translate a sandbox-local PID to its host PID, if currently alive.
@@ -314,17 +337,41 @@ impl LinuxBackend {
         Ok(cmd)
     }
 
+    fn build_command_ruleset(
+        &self,
+        guard: &LiveRules,
+        pty_slave_fd: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> Result<landlock_rules::PreparedRuleset> {
+        let mut ruleset = match &self.broker {
+            Some(broker) => broker.build_command_ruleset(guard.proxy_port)?,
+            None => landlock_rules::build_ruleset(&guard.config, guard.proxy_port)?,
+        };
+        if let Some(proc_fd) = self.runner.as_deref().and_then(Runner::proc_fd) {
+            let proc_writable = guard.config.writable_file_system() && self.broker.is_none();
+            ruleset.grant_private_proc(proc_fd, proc_writable)?;
+        }
+        if let Some(slave_fd) = pty_slave_fd {
+            ruleset.grant_pty_slave(slave_fd)?;
+        }
+        Ok(ruleset)
+    }
+
     fn spawn_sync(&self, request: &SpawnRequest<'_>) -> Result<Child> {
         if let (Some(runner), Some(live)) = (&self.runner, &self.live) {
-            use std::os::fd::AsFd;
             let envs = merged_envs(request.config, request.envs);
             let setup = PreExecSetup::new(request.config)?;
             let (limits, nice, io_policy) = setup.raw_parts();
-            let ruleset_fd = live
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .ruleset
-                .duplicate_fd()?;
+            let ruleset_fd = {
+                let guard = live
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(slave_fd) = request.pty_slave_fd {
+                    self.build_command_ruleset(&guard, Some(slave_fd))?
+                        .duplicate_fd()?
+                } else {
+                    guard.ruleset.duplicate_fd()?
+                }
+            };
 
             let (notif_filter, broker_child_sock, broker_handoff) = match &self.broker {
                 Some(broker) => {
@@ -349,6 +396,7 @@ impl LinuxBackend {
                 &limits,
                 nice,
                 io_policy,
+                None,
                 LinuxSpawnExtra {
                     ruleset: Some(ruleset_fd.as_fd()),
                     notif_filter: &notif_filter,
@@ -356,18 +404,113 @@ impl LinuxBackend {
                     broker_child_sock,
                     broker_handoff,
                     inherit_fds: request.inherit_fds,
+                    pty_slave_inode: request.pty_slave_inode,
                 },
             )?;
             return Ok(Child::new(UnixChild::from_runner(child)));
         }
 
         let mut cmd = self.build_host_command(request)?;
-        cmd.stdin(std::process::Stdio::from(request.stdin));
-        cmd.stdout(std::process::Stdio::from(request.stdout));
-        cmd.stderr(std::process::Stdio::from(request.stderr));
+        cmd.stdin(Stdio::from(request.stdin));
+        cmd.stdout(Stdio::from(request.stdout));
+        cmd.stderr(Stdio::from(request.stderr));
         cmd.process_group(0);
         let child = cmd.spawn()?;
         Ok(Child::new(UnixChild::new(child)))
+    }
+
+    fn spawn_pty_sync(
+        &self,
+        request: &SpawnRequest<'_>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(Child, PtyMaster)> {
+        let pty = AllocatedPty::open(cols, rows)?;
+
+        if let (Some(runner), Some(live)) = (&self.runner, &self.live) {
+            let envs = merged_envs(request.config, request.envs);
+            let setup = PreExecSetup::new(request.config)?;
+            let (limits, nice, io_policy) = setup.raw_parts();
+            let ruleset_fd = {
+                let guard = live
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.build_command_ruleset(&guard, Some(pty.slave.as_fd()))?
+                    .duplicate_fd()?
+            };
+
+            let (notif_filter, broker_child_sock, broker_handoff) = match &self.broker {
+                Some(broker) => {
+                    let (parent_sock, child_sock) = broker.prepare_sockets()?;
+                    (
+                        broker.program_bytes(),
+                        Some(child_sock),
+                        Some((broker, parent_sock)),
+                    )
+                }
+                None => (Vec::new(), None, None),
+            };
+
+            let child = runner.spawn_command(
+                request.program,
+                request.args,
+                &envs,
+                request.working_dir(),
+                request.stdin,
+                request.stdout,
+                request.stderr,
+                &limits,
+                nice,
+                io_policy,
+                Some(pty.slave.as_raw_fd()),
+                LinuxSpawnExtra {
+                    ruleset: Some(ruleset_fd.as_fd()),
+                    notif_filter: &notif_filter,
+                    seccomp_filters: &self.seccomp_filters,
+                    broker_child_sock,
+                    broker_handoff,
+                    inherit_fds: request.inherit_fds,
+                    pty_slave_inode: Some(pty.slave_inode),
+                },
+            )?;
+            drop(pty.slave);
+            return Ok((Child::new(UnixChild::from_runner(child)), pty.master));
+        }
+
+        let setup = PreExecSetup::new(request.config)?;
+        let mut cmd = Command::new(request.program);
+        cmd.args(request.args);
+        cmd.current_dir(request.working_dir());
+        cmd.env_clear();
+        for (key, value) in merged_envs(request.config, request.envs) {
+            cmd.env(key, value);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let slave_raw = pty.slave.as_raw_fd();
+        let inherit_fds: Vec<(std::os::fd::RawFd, i32)> = request.inherit_fds.to_vec();
+        // SAFETY: `pre_exec` runs in the forked child before `exec` and only
+        // issues async-signal-safe PTY attachment, `dup2`/`fcntl`, and `setup.apply`.
+        unsafe {
+            cmd.pre_exec(move || {
+                attach_slave_in_child(slave_raw)?;
+                for &(src_fd, dst_fd) in &inherit_fds {
+                    if src_fd == dst_fd {
+                        if libc::fcntl(dst_fd, libc::F_SETFD, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    } else if libc::dup2(src_fd, dst_fd) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                setup.apply()
+            });
+        }
+        let child = cmd.spawn()?;
+        drop(pty.slave);
+        Ok((Child::new(UnixChild::new(child)), pty.master))
     }
 }
 
@@ -422,6 +565,31 @@ impl Backend for LinuxBackend {
         );
 
         Ok(child)
+    }
+
+    async fn spawn_pty(
+        &self,
+        request: SpawnRequest<'_>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(Child, PtyMaster)> {
+        tracing::debug!(
+            program = %request.program,
+            args = ?request.args,
+            cols,
+            rows,
+            "sandbox: spawning PTY"
+        );
+
+        let (child, master) = self.spawn_pty_sync(&request, cols, rows)?;
+        tracing::debug!(
+            program = %request.program,
+            host_pid = child.id(),
+            sandbox_pid = child.sandbox_id(),
+            "sandbox: spawned PTY"
+        );
+
+        Ok((child, master))
     }
 }
 
