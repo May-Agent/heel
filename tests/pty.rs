@@ -696,7 +696,7 @@ async fn supervised_pty_spawn_works_and_isolates_on_linux() {
     let host_sb = start(
         SandboxConfigBuilder::default()
             .host_access()
-            .heel_binary(heel_bin)
+            .heel_binary(heel_bin.clone())
             .supervised_spawn(true),
     )
     .await;
@@ -725,4 +725,58 @@ async fn supervised_pty_spawn_works_and_isolates_on_linux() {
         .expect("waits in time")
         .expect("waits");
     assert!(host_exit.status.success());
+
+    // 4. Confined supervised PTY when the parent holds enough open fds that the
+    //    runner's control socket lands above fd 5, placing `ruleset_fd` on fd 5
+    //    (colliding with the supervised PTY target fd 5 unless relocated).
+    let _held_fds: Vec<std::fs::File> = (0..16)
+        .map(|_| std::fs::File::open("/dev/null").expect("opens /dev/null"))
+        .collect();
+    let high_fd_sandbox = start(
+        SandboxConfigBuilder::default()
+            .heel_binary(heel_bin.clone())
+            .supervised_spawn(true),
+    )
+    .await;
+    let (mut high_fg, high_master) = high_fd_sandbox
+        .command("/bin/sh")
+        .args(["-c", "stty size"])
+        .spawn_supervised_pty(Foreground { reap_timeout: reap }, 90, 30)
+        .await
+        .expect("spawns confined supervised PTY without ruleset fd collision");
+    let high_out = read_to_eof(&high_master, TIMEOUT).await;
+    drop(high_master);
+    assert!(high_out.contains("30 90"), "got: {high_out:?}");
+    let high_exit = tokio::time::timeout(TIMEOUT, high_fg.wait())
+        .await
+        .expect("waits in time")
+        .expect("waits");
+    assert!(high_exit.status.success(), "got: {high_exit:?}");
+
+    // 5. Nested child supervised PTY with broker active (matching aither-sandbox's
+    //    child sandbox layout where the nested runner receives `ruleset_fd = 5`).
+    let nested = start(
+        SandboxConfigBuilder::default()
+            .parent(sandbox.handle())
+            .filesystem_strict(false)
+            .read_denylist(ReadDenylist::credentials().home(home.path()))
+            .write_denylist(WriteDenylist::persistence().home(home.path()))
+            .heel_binary(heel_bin)
+            .supervised_spawn(true),
+    )
+    .await;
+    let (mut nested_fg, nested_master) = nested
+        .command("/bin/sh")
+        .args(["-c", "stty size"])
+        .spawn_supervised_pty(Foreground { reap_timeout: reap }, 96, 32)
+        .await
+        .expect("spawns nested confined supervised PTY without ruleset fd collision");
+    let nested_out = read_to_eof(&nested_master, TIMEOUT).await;
+    drop(nested_master);
+    assert!(nested_out.contains("32 96"), "got: {nested_out:?}");
+    let nested_exit = tokio::time::timeout(TIMEOUT, nested_fg.wait())
+        .await
+        .expect("waits in time")
+        .expect("waits");
+    assert!(nested_exit.status.success(), "got: {nested_exit:?}");
 }

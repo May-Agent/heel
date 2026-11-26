@@ -318,19 +318,11 @@ impl LinuxBackend {
             cmd.env(key, value);
         }
 
-        let inherit_fds: Vec<(std::os::fd::RawFd, i32)> = request.inherit_fds.to_vec();
+        let mut inherit_fds: Vec<(std::os::fd::RawFd, i32)> = request.inherit_fds.to_vec();
         // SAFETY: `pre_exec` only calls async-signal-safe `fcntl`, `dup2` and `setup.apply`.
         unsafe {
             cmd.pre_exec(move || {
-                for &(src_fd, dst_fd) in &inherit_fds {
-                    if src_fd == dst_fd {
-                        if libc::fcntl(dst_fd, libc::F_SETFD, 0) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    } else if libc::dup2(src_fd, dst_fd) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
+                apply_inherit_fds(&mut inherit_fds)?;
                 setup.apply()
             });
         }
@@ -490,21 +482,13 @@ impl LinuxBackend {
             .stderr(Stdio::null());
 
         let slave_raw = pty.slave.as_raw_fd();
-        let inherit_fds: Vec<(std::os::fd::RawFd, i32)> = request.inherit_fds.to_vec();
+        let mut inherit_fds: Vec<(std::os::fd::RawFd, i32)> = request.inherit_fds.to_vec();
         // SAFETY: `pre_exec` runs in the forked child before `exec` and only
         // issues async-signal-safe PTY attachment, `dup2`/`fcntl`, and `setup.apply`.
         unsafe {
             cmd.pre_exec(move || {
                 attach_slave_in_child(slave_raw)?;
-                for &(src_fd, dst_fd) in &inherit_fds {
-                    if src_fd == dst_fd {
-                        if libc::fcntl(dst_fd, libc::F_SETFD, 0) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    } else if libc::dup2(src_fd, dst_fd) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
+                apply_inherit_fds(&mut inherit_fds)?;
                 setup.apply()
             });
         }
@@ -512,6 +496,44 @@ impl LinuxBackend {
         drop(pty.slave);
         Ok((Child::new(UnixChild::new(child)), pty.master))
     }
+}
+
+/// Relocates inherited source descriptors above the highest target slot before
+/// running `dup2`, preventing source/target collisions when passing multiple
+/// fixed-number fds (e.g. `3, 4, 5` for supervised PTY commands).
+///
+/// # Safety
+/// Must be called in a single-threaded post-fork child (`pre_exec`).
+unsafe fn apply_inherit_fds(inherit_fds: &mut [(std::os::fd::RawFd, i32)]) -> std::io::Result<()> {
+    if inherit_fds.is_empty() {
+        return Ok(());
+    }
+    let min_safe = inherit_fds
+        .iter()
+        .map(|&(_, dst)| dst)
+        .max()
+        .unwrap_or(2)
+        .saturating_add(1)
+        .max(3);
+    for pair in inherit_fds.iter_mut() {
+        if pair.0 < min_safe {
+            // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` is async-signal-safe and `pair.0` is open.
+            let moved = unsafe { libc::fcntl(pair.0, libc::F_DUPFD_CLOEXEC, min_safe) };
+            if moved == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `moved` references the same file description, so closing `pair.0` is safe.
+            let _ = unsafe { libc::close(pair.0) };
+            pair.0 = moved;
+        }
+    }
+    for &(src_fd, dst_fd) in inherit_fds.iter() {
+        // SAFETY: `src_fd >= min_safe > dst_fd`, so `dup2` cannot clobber any other source fd.
+        if unsafe { libc::dup2(src_fd, dst_fd) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn merged_envs(config: &SandboxConfigData, envs: &[(String, String)]) -> Vec<(String, String)> {
