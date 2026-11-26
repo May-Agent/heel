@@ -3,7 +3,9 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 
-use crate::error::{Error, Result};
+#[cfg(unix)]
+use crate::error::Error;
+use crate::error::Result;
 
 /// Host-side master end of a pseudo-terminal allocated for a spawned command.
 ///

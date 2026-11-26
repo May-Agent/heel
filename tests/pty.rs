@@ -599,6 +599,8 @@ async fn supervised_pty_spawn_works_and_isolates_on_linux() {
     let home = fixtures::host::home_with(&[".ssh/id_rsa"]);
     let reap = Duration::from_secs(10);
 
+    let heel_bin = heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary");
+
     // 1. Confined supervised sandbox with broker.
     let sandbox = start(
         SandboxConfigBuilder::default()
@@ -606,6 +608,7 @@ async fn supervised_pty_spawn_works_and_isolates_on_linux() {
             .read_denylist(ReadDenylist::credentials().home(home.path()))
             .write_denylist(WriteDenylist::persistence().home(home.path()))
             .executable(fixtures::resolved(&probe))
+            .heel_binary(heel_bin.clone())
             .supervised_spawn(true),
     )
     .await;
@@ -693,6 +696,7 @@ async fn supervised_pty_spawn_works_and_isolates_on_linux() {
     let host_sb = start(
         SandboxConfigBuilder::default()
             .host_access()
+            .heel_binary(heel_bin)
             .supervised_spawn(true),
     )
     .await;

@@ -469,6 +469,21 @@ fn open_write(
                         return Ok(Reply::Continue);
                     }
                 }
+                if place.in_proc
+                    && is(&stat, FileType::Symlink)
+                    && let Some(slave_inode) = shared.pty_slave_inode()
+                    && let Ok(followed) =
+                        rustix::fs::statat(&place.parent, place.kernel_name(), AtFlags::empty())
+                    && is(&followed, FileType::CharacterDevice)
+                    && identity(&followed) == slave_inode
+                {
+                    // `/dev/fd/N` and `/proc/self/fd/N` pointing at this
+                    // command's own PTY slave: continue in the caller so the
+                    // kernel opens the slave under the write-stripped Landlock
+                    // ruleset (which permits writes only on `/dev/tty` and this
+                    // command's slave inode).
+                    return Ok(Reply::Continue);
+                }
                 if !g.can_write(&target) {
                     return Err(EACCES);
                 }
