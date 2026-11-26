@@ -63,6 +63,28 @@ impl PreparedRuleset {
         self.add_inode(proc_fd, access, abi)
     }
 
+    /// Add read and write access on `/dev/tty` (safe because the kernel
+    /// resolves `/dev/tty` strictly to the calling process's own controlling
+    /// terminal, or fails with `ENXIO` when there is none).
+    pub(crate) fn grant_dev_tty(&mut self) -> Result<()> {
+        add_system_path(
+            &mut self.inner,
+            "/dev/tty",
+            make_bitflags!(AccessFs::{ ReadFile | WriteFile }),
+            REQUIRED_ABI,
+        )
+    }
+
+    /// Add per-command read and write access for one command's own PTY slave
+    /// inode without opening `/dev/pts` or sibling commands' slave devices.
+    pub(crate) fn grant_pty_slave(&mut self, slave_fd: BorrowedFd<'_>) -> Result<()> {
+        self.add_inode(
+            slave_fd,
+            make_bitflags!(AccessFs::{ ReadFile | WriteFile }),
+            REQUIRED_ABI,
+        )
+    }
+
     /// Add a rule for an inode held by `fd`, narrowed to what the inode can take.
     ///
     /// The ruleset keeps its own reference to the inode, so `fd` can be closed
@@ -495,15 +517,19 @@ fn plan_device_rules(rules: &mut Vec<Planned>, config: &SandboxConfigData, abi: 
         device(path, AccessFs::from_all(abi));
     }
 
-    // Terminals are readable so interactive programs can query them, and
-    // writable only when the configuration allows terminal output.
-    let tty_access = if config.allow_tty_write() {
-        AccessFs::from_all(abi)
-    } else {
-        AccessFs::from_read(abi)
-    };
-    for path in ["/dev/tty", "/dev/ptmx", "/dev/pts"] {
-        device(path, tty_access);
+    // `/dev/tty` resolves strictly to the calling process's own controlling
+    // terminal (returning `ENXIO` when none is attached), so read/write access
+    // on it exposes no other terminal. `/dev/ptmx` and `/dev/pts` are granted
+    // wholesale only when `allow_tty_write` is explicitly enabled; per-command
+    // PTY spawns instead grant only their own slave inode via `grant_pty_slave`.
+    device(
+        "/dev/tty",
+        make_bitflags!(AccessFs::{ ReadFile | WriteFile }),
+    );
+    if config.allow_tty_write() {
+        for path in ["/dev/ptmx", "/dev/pts"] {
+            device(path, AccessFs::from_all(abi));
+        }
     }
 
     let security = config.security();
@@ -1021,6 +1047,31 @@ mod tests {
                 .iter()
                 .any(|rule| rule.path == directory.path()),
             "the persistent grant is present in the Landlock rules"
+        );
+    }
+
+    #[test]
+    fn device_rules_allow_dev_tty_without_opening_dev_pts_by_default() {
+        let (default_data, _a) = prepared(SandboxConfig::new());
+        let default_plan = plan(&default_data);
+        let tty_rule = default_plan
+            .iter()
+            .find(|r| r.path == Path::new("/dev/tty"))
+            .expect("/dev/tty rule present");
+        assert!(tty_rule.access.contains(AccessFs::ReadFile));
+        assert!(tty_rule.access.contains(AccessFs::WriteFile));
+        assert!(
+            !default_plan.iter().any(|r| r.path == Path::new("/dev/pts")),
+            "/dev/pts must not be granted wholesale when allow_tty_write is false"
+        );
+
+        let (tty_write_data, _b) = prepared(SandboxConfig::builder().allow_tty_write(true).build());
+        let tty_write_plan = plan(&tty_write_data);
+        assert!(
+            tty_write_plan
+                .iter()
+                .any(|r| r.path == Path::new("/dev/pts")),
+            "/dev/pts is granted only when allow_tty_write is explicitly enabled"
         );
     }
 

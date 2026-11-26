@@ -6,7 +6,7 @@ use std::process::{ExitStatus, Output, Stdio};
 
 use crate::config::SandboxConfigData;
 use crate::error::Result;
-use crate::platform::{Backend, Child, NativeBackend, SpawnRequest, env_name_eq};
+use crate::platform::{Backend, Child, NativeBackend, PtyMaster, SpawnRequest, env_name_eq};
 use crate::sandbox::ProcessTracker;
 
 /// The `PATH` a sandboxed process gets when nothing else specifies one.
@@ -186,6 +186,23 @@ impl<'a> Command<'a> {
         )
     }
 
+    /// Build the environment for a PTY command, defaulting `TERM` to
+    /// `xterm-256color` when neither the command nor an explicit passthrough
+    /// supplies one.
+    fn build_pty_envs(&self) -> Vec<(String, String)> {
+        let mut envs = self.build_envs();
+        let has_term = envs.iter().any(|(key, _)| env_name_eq(key, "TERM"))
+            || self
+                .config
+                .env_passthrough()
+                .iter()
+                .any(|var| env_name_eq(var, "TERM") && std::env::var_os(var).is_some());
+        if !has_term {
+            envs.push(("TERM".to_owned(), "xterm-256color".to_owned()));
+        }
+        envs
+    }
+
     /// Assemble the platform request for this command.
     fn request<'r>(
         &'r self,
@@ -207,6 +224,10 @@ impl<'a> Command<'a> {
             stderr,
             #[cfg(target_os = "linux")]
             inherit_fds: &[],
+            #[cfg(target_os = "linux")]
+            pty_slave_fd: None,
+            #[cfg(target_os = "linux")]
+            pty_slave_inode: None,
         }
     }
 
@@ -265,6 +286,41 @@ impl<'a> Command<'a> {
 
         self.process_tracker.register(child.id());
         Ok(child.with_tracker(self.process_tracker.clone()))
+    }
+
+    /// Spawn the command attached to a new pseudo-terminal with initial
+    /// `(cols, rows)` dimensions.
+    ///
+    /// The child runs in a new session with the PTY slave as its controlling
+    /// terminal (`setsid` + `TIOCSCTTY`) and all three standard streams wired
+    /// to that slave. `TERM` defaults to `xterm-256color` when unset. On
+    /// confined Unix sandboxes, terminal device access is isolated to `/dev/tty`
+    /// and this command's own slave PTY without opening unrelated host PTYs or
+    /// sibling commands' slave PTYs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`](crate::Error::Unsupported) on platforms
+    /// without per-command PTY support (Windows), or an error if allocating the
+    /// PTY or spawning the child fails.
+    pub async fn spawn_pty(self, cols: u16, rows: u16) -> Result<(Child, PtyMaster)> {
+        let envs = self.build_pty_envs();
+        let (child, master) = self
+            .backend
+            .spawn_pty(
+                self.request(
+                    &envs,
+                    StdioConfig::Null,
+                    StdioConfig::Null,
+                    StdioConfig::Null,
+                ),
+                cols,
+                rows,
+            )
+            .await?;
+
+        self.process_tracker.register(child.id());
+        Ok((child.with_tracker(self.process_tracker.clone()), master))
     }
 
     /// Spawn the command under a supervisor that owns its whole process tree.
@@ -335,6 +391,8 @@ impl<'a> Command<'a> {
                 stdout: self.stdio(self.stdout),
                 stderr: self.stdio(self.stderr),
                 inherit_fds: &inherit_pairs,
+                pty_slave_fd: None,
+                pty_slave_inode: None,
             };
             let mut child = self.backend.spawn(request).await?;
             drop((inherited_ctl, inherited_cred));
@@ -393,6 +451,8 @@ impl<'a> Command<'a> {
             stdout: self.stdio(self.stdout),
             stderr: self.stdio(self.stderr),
             inherit_fds: &inherit_pairs,
+            pty_slave_fd: None,
+            pty_slave_inode: None,
         };
         let child = self.backend.spawn(request).await?;
         drop(inherited_ctl);
@@ -407,6 +467,117 @@ impl<'a> Command<'a> {
         let child = child.with_tracker(self.process_tracker.clone());
         Ok(crate::supervisor::SupervisedChild::new(
             child, cmd_pid, cmd_pid, shared,
+        ))
+    }
+
+    /// Spawn the command on a new pseudo-terminal under a supervisor that owns
+    /// its whole process tree.
+    ///
+    /// The supervisor itself holds no controlling terminal and closes its copy
+    /// of the slave descriptor immediately after spawning the command; the
+    /// supervised command runs in a new session with the slave as its
+    /// controlling terminal (`setsid` + `TIOCSCTTY`), receives `SIGWINCH` on
+    /// [`PtyMaster::resize`], and is isolated to `/dev/tty` plus its own slave
+    /// PTY inode on confined sandboxes.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the sandbox was not built with
+    /// [`supervised_spawn(true)`](crate::SandboxConfigBuilder::supervised_spawn),
+    /// if the PTY cannot be allocated, or if the supervisor cannot be started.
+    #[cfg(target_os = "linux")]
+    pub async fn spawn_supervised_pty<M: crate::supervisor::Supervision>(
+        self,
+        mode: M,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(crate::supervisor::SupervisedChild<M>, PtyMaster)> {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        if !self.config.supervised_spawn() {
+            return Err(crate::error::Error::SupervisorNotConfigured);
+        }
+
+        let pty = crate::platform::pty::AllocatedPty::open(cols, rows)?;
+        let (host, supervisor_end) = std::os::unix::net::UnixStream::pair()?;
+        let inherited_ctl =
+            rustix::io::fcntl_dupfd_cloexec(&supervisor_end, 3).map_err(std::io::Error::from)?;
+        drop(supervisor_end);
+        let (cred_read, cred_write) = std::os::unix::net::UnixStream::pair()?;
+        crate::platform::runner::enable_passcred(cred_read.as_raw_fd())?;
+        let inherited_cred =
+            rustix::io::fcntl_dupfd_cloexec(&cred_write, 4).map_err(std::io::Error::from)?;
+        drop(cred_write);
+
+        let shared = crate::supervisor::Shared::new(host, mode.reap_timeout())?;
+        let envs = self.build_pty_envs();
+        let runner_path = match self.backend.runner_executable() {
+            Some(path) => path.to_path_buf(),
+            None => self.backend.host_runner_executable()?,
+        };
+        let runner_str = runner_path.to_str().ok_or_else(|| {
+            crate::error::Error::InitFailed(format!(
+                "runner binary path is not UTF-8: {}",
+                runner_path.display()
+            ))
+        })?;
+
+        let ctl_target = 3i32;
+        let cred_target = 4i32;
+        let pty_target = 5i32;
+        let reap_ms = mode.reap_timeout().as_millis().to_string();
+        let mut arguments = Vec::with_capacity(7 + self.args.len());
+        arguments.push("--supervise-pty".to_owned());
+        arguments.push(mode.mode().as_str().to_owned());
+        arguments.push(ctl_target.to_string());
+        arguments.push(cred_target.to_string());
+        arguments.push(pty_target.to_string());
+        arguments.push(reap_ms);
+        arguments.push("--".to_owned());
+        arguments.push(self.program.clone());
+        arguments.extend_from_slice(&self.args);
+
+        let inherit_pairs = [
+            (inherited_ctl.as_raw_fd(), ctl_target),
+            (inherited_cred.as_raw_fd(), cred_target),
+            (pty.slave.as_raw_fd(), pty_target),
+        ];
+        let request = SpawnRequest {
+            config: self.config,
+            program: runner_str,
+            args: &arguments,
+            envs: &envs,
+            current_dir: self.current_dir.as_deref(),
+            stdin: StdioConfig::Null,
+            stdout: StdioConfig::Null,
+            stderr: StdioConfig::Null,
+            inherit_fds: &inherit_pairs,
+            pty_slave_fd: Some(pty.slave.as_fd()),
+            pty_slave_inode: Some(pty.slave_inode),
+        };
+        let mut child = self.backend.spawn(request).await?;
+        drop((inherited_ctl, inherited_cred, pty.slave));
+
+        let sup_pid = child.id();
+        let reaper = child.take_reaper()?;
+        shared.set_reaper(reaper);
+
+        let wait_shared = std::sync::Arc::clone(&shared);
+        let (cmd_sandbox_pid, cmd_host_pid) = blocking::unblock(move || {
+            if let Some(spid) = wait_shared.wait_started() {
+                let hpid = crate::platform::runner::read_cred_pid(&cred_read).unwrap_or(sup_pid);
+                (spid, hpid)
+            } else {
+                (sup_pid, sup_pid)
+            }
+        })
+        .await;
+
+        self.process_tracker
+            .register_supervisor(sup_pid, std::sync::Arc::downgrade(&shared));
+        Ok((
+            crate::supervisor::SupervisedChild::new(child, cmd_host_pid, cmd_sandbox_pid, shared),
+            pty.master,
         ))
     }
 }

@@ -1076,6 +1076,29 @@ async fn a_writable_file_system_is_refused_rather_than_run_as_strict() {
     );
 }
 
+#[tokio::test]
+async fn pty_spawn_returns_unsupported_error_on_windows() {
+    let sandbox = sandbox_with(SandboxConfigBuilder::default().build()).await;
+    let Err(error) = sandbox
+        .command("cmd.exe")
+        .args(["/C", "echo hi"])
+        .spawn_pty(80, 24)
+        .await
+    else {
+        panic!("PTY spawn is unsupported on Windows until ConPTY lands");
+    };
+    assert!(
+        matches!(
+            error,
+            heel::Error::Unsupported {
+                operation: "PTY spawn",
+                platform: "windows"
+            }
+        ),
+        "unexpected error: {error}"
+    );
+}
+
 /// The host's own non-loopback address, learned the way a client picks its
 /// source address: "connecting" a UDP socket to a public address selects the
 /// route without sending a packet.

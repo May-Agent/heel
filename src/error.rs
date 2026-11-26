@@ -38,6 +38,15 @@ pub enum Error {
         platform: &'static str,
     },
 
+    /// An operation is not supported on this platform.
+    #[error("{operation} is not supported on {platform}")]
+    Unsupported {
+        /// The operation that cannot run.
+        operation: &'static str,
+        /// The platform that does not support it.
+        platform: &'static str,
+    },
+
     /// The backend could not be initialized.
     #[error("sandbox initialization failed: {0}")]
     InitFailed(String),

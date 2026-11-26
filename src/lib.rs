@@ -148,11 +148,11 @@ pub use network::{
     AllowAll, AllowList, Audited, CustomPolicy, DenyAll, DomainRequest, HostAccess,
     NetworkAuditLog, NetworkPolicy,
 };
-pub use platform::Child;
 #[cfg(target_os = "macos")]
 pub use platform::macos::attribution::{AttributionError, Membership};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use platform::runner::SandboxHandle;
+pub use platform::{Child, PtyMaster};
 pub use policy::{ReadDenylist, WriteDenylist};
 pub use priority::{CpuPriority, InvalidNiceLevel, IoPriority, NiceLevel, ProcessPriority};
 pub use python::VenvManager;

@@ -41,7 +41,7 @@ use sid::Sid;
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::identity::NamedProfile;
-use crate::platform::{Backend, Child, SpawnRequest, env_name_eq};
+use crate::platform::{Backend, Child, PtyMaster, SpawnRequest, env_name_eq};
 
 /// A launch-prep failure that names the call which produced it.
 ///
@@ -570,6 +570,18 @@ impl Backend for WindowsBackend {
 
         self.launch(request)
     }
+
+    async fn spawn_pty(
+        &self,
+        _request: SpawnRequest<'_>,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(Child, PtyMaster)> {
+        Err(Error::Unsupported {
+            operation: "PTY spawn",
+            platform: "windows",
+        })
+    }
 }
 
 #[cfg(test)]
@@ -585,6 +597,7 @@ mod tests {
         const fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<crate::Sandbox>();
         assert_send_sync::<crate::Child>();
+        assert_send_sync::<crate::PtyMaster>();
     };
 
     #[test]
