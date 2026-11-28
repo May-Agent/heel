@@ -168,6 +168,8 @@ pub(crate) struct Runner {
     init_host_pid: u32,
     #[cfg(target_os = "linux")]
     proc_fd: Option<OwnedFd>,
+    #[cfg(target_os = "linux")]
+    fixed_ids: Option<(u32, u32)>,
     outer_child: Mutex<Option<std::process::Child>>,
     #[cfg_attr(
         target_os = "macos",
@@ -271,7 +273,7 @@ impl Runner {
             .map_err(|e| Error::InitFailed(format!("cannot start Linux namespace runner: {e}")))?;
         drop(child_fd);
 
-        let (init_host_pid, proc_fd) = match read_linux_handshake(&host_sock) {
+        let init = match read_linux_handshake(&host_sock) {
             Ok(res) => res,
             Err(err) => {
                 let mut stderr = String::new();
@@ -287,13 +289,7 @@ impl Runner {
             }
         };
 
-        Self::from_connected(
-            host_sock,
-            init_host_pid,
-            Some(proc_fd),
-            Some(child),
-            Some(staged),
-        )
+        Self::from_connected(host_sock, init, Some(child), Some(staged))
     }
 
     #[cfg(target_os = "linux")]
@@ -324,16 +320,15 @@ impl Runner {
             }
         }
 
-        let (init_host_pid, proc_fd) = read_linux_handshake(&host_sock)
+        let init = read_linux_handshake(&host_sock)
             .map_err(|e| Error::InitFailed(format!("nested Linux runner handshake failed: {e}")))?;
 
-        Self::from_connected(host_sock, init_host_pid, Some(proc_fd), None, Some(staged))
+        Self::from_connected(host_sock, init, None, Some(staged))
     }
 
     fn from_connected(
         host_sock: UnixStream,
-        #[cfg(target_os = "linux")] init_host_pid: u32,
-        #[cfg(target_os = "linux")] proc_fd: Option<OwnedFd>,
+        #[cfg(target_os = "linux")] init: LinuxHandshake,
         outer_child: Option<std::process::Child>,
         staged: Option<StagedRunner>,
     ) -> Result<Arc<Self>> {
@@ -351,9 +346,11 @@ impl Runner {
             mailbox,
             next_id: AtomicU64::new(1),
             #[cfg(target_os = "linux")]
-            init_host_pid,
+            init_host_pid: init.pid,
             #[cfg(target_os = "linux")]
-            proc_fd,
+            proc_fd: Some(init.proc_fd),
+            #[cfg(target_os = "linux")]
+            fixed_ids: init.fixed_ids,
             outer_child: Mutex::new(outer_child),
             staged,
         }))
@@ -364,6 +361,12 @@ impl Runner {
     pub(crate) fn proc_fd(&self) -> Option<BorrowedFd<'_>> {
         use std::os::fd::AsFd;
         self.proc_fd.as_ref().map(AsFd::as_fd)
+    }
+
+    /// The only UID and GID confined children can hold, when verified by the runner.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fixed_ids(&self) -> Option<(u32, u32)> {
+        self.fixed_ids
     }
 
     /// Host PID of the container's PID 1 (`init`) on Linux.
@@ -1168,7 +1171,14 @@ pub(crate) fn read_cred_pid(sock: &UnixStream) -> io::Result<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_linux_handshake(sock: &UnixStream) -> io::Result<(u32, OwnedFd)> {
+struct LinuxHandshake {
+    pid: u32,
+    proc_fd: OwnedFd,
+    fixed_ids: Option<(u32, u32)>,
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_handshake(sock: &UnixStream) -> io::Result<LinuxHandshake> {
     let mut len_bytes = [0u8; 4];
     let mut peer_pid = None;
     let mut proc_fd: Option<OwnedFd> = None;
@@ -1243,11 +1253,28 @@ fn read_linux_handshake(sock: &UnixStream) -> io::Result<(u32, OwnedFd)> {
     let mut clone = sock.try_clone()?;
     clone.read_exact(&mut body)?;
     parse_handshake_frame(&body)?;
-    let init_pid = peer_pid
+    let fixed_ids = match &body[5..] {
+        [] => None,
+        &[u0, u1, u2, u3, g0, g1, g2, g3] => Some((
+            u32::from_le_bytes([u0, u1, u2, u3]),
+            u32::from_le_bytes([g0, g1, g2, g3]),
+        )),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid runner identity",
+            ));
+        }
+    };
+    let pid = peer_pid
         .ok_or_else(|| io::Error::other("kernel did not supply SCM_CREDENTIALS on handshake"))?;
-    let pfd = proc_fd
+    let proc_fd = proc_fd
         .ok_or_else(|| io::Error::other("runner did not supply private /proc descriptor"))?;
-    Ok((init_pid, pfd))
+    Ok(LinuxHandshake {
+        pid,
+        proc_fd,
+        fixed_ids,
+    })
 }
 
 /// Issue a macOS Seatbelt file extension token for `grant`.

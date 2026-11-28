@@ -15,10 +15,8 @@ use crate::error::{Error, Result};
 
 /// Compiled filters, ready to be applied after fork.
 ///
-/// Two programs rather than one, because a `SeccompFilter` carries a single
-/// action for everything it matches and `clone3` needs a different one. Their
-/// rule sets are disjoint, so each returns `Allow` wherever the other decides
-/// and the kernel's "most restrictive result wins" leaves no ambiguity.
+/// A `SeccompFilter` carries a single action for everything it matches. The
+/// general denial filter is installed before the filters for special results.
 pub(crate) struct PreparedFilter {
     programs: Vec<seccompiler::BpfProgram>,
     /// Programs written by hand, installed after the compiled ones.
@@ -61,7 +59,10 @@ impl PreparedFilter {
 ///
 /// `allow_tcp` is true only when the sandbox has a network proxy to reach;
 /// when false, TCP sockets cannot be created at all.
-pub(crate) fn build_filter(allow_tcp: bool) -> Result<PreparedFilter> {
+pub(crate) fn build_filter(
+    allow_tcp: bool,
+    fixed_ids: Option<(u32, u32)>,
+) -> Result<PreparedFilter> {
     let arch = detect_arch()?;
 
     // Default-allow with explicit blocks. A default-deny filter would need a
@@ -88,6 +89,24 @@ pub(crate) fn build_filter(allow_tcp: bool) -> Result<PreparedFilter> {
         arch,
     )?;
 
+    let mut programs = vec![denied, unsupported];
+    if let Some((uid, gid)) = fixed_ids {
+        // glibc's POSIX_SPAWN_RESETIDS sets only the effective IDs. The
+        // runner proved these exact requests cannot change credentials.
+        // ERRNO(0) skips the syscall and reports success. Installed after
+        // the general EPERM filter, it wins only for these argument tuples.
+        let unchanged = u64::from(u32::MAX);
+        let reset = |id| rule(&[(0, unchanged), (1, u64::from(id)), (2, unchanged)]);
+        programs.push(compile(
+            BTreeMap::from([
+                (libc::SYS_setresuid, vec![reset(uid)?]),
+                (libc::SYS_setresgid, vec![reset(gid)?]),
+            ]),
+            SeccompAction::Errno(0),
+            arch,
+        )?);
+    }
+
     tracing::debug!(allow_tcp, "seccomp: filters built");
 
     // Installed last, so that where it and an earlier program both answer with
@@ -100,10 +119,7 @@ pub(crate) fn build_filter(allow_tcp: bool) -> Result<PreparedFilter> {
     #[cfg(not(target_arch = "x86_64"))]
     let raw = Vec::new();
 
-    Ok(PreparedFilter {
-        programs: vec![denied, unsupported],
-        raw,
-    })
+    Ok(PreparedFilter { programs, raw })
 }
 
 /// Compile one rule set into a BPF program.
@@ -330,7 +346,7 @@ mod tests {
     #[test]
     fn filters_compile_in_both_network_modes() {
         for allow_tcp in [false, true] {
-            let filter = build_filter(allow_tcp).expect("builds");
+            let filter = build_filter(allow_tcp, None).expect("builds");
             assert!(filter.programs.iter().all(|program| !program.is_empty()));
         }
     }
@@ -391,7 +407,7 @@ mod tests {
             "clone3 belongs to its own ENOSYS filter"
         );
         assert_eq!(
-            build_filter(true).expect("builds").programs.len(),
+            build_filter(true, None).expect("builds").programs.len(),
             2,
             "the general filter and the clone3 filter are installed separately"
         );

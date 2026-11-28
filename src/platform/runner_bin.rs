@@ -1073,9 +1073,13 @@ mod linux_ns {
     }
 
     pub fn send_handshake_with_proc(control: &UnixStream, proc_fd: RawFd) -> io::Result<()> {
-        let mut payload = Vec::with_capacity(5);
+        let mut payload = Vec::with_capacity(13);
         payload.push(EV_ACK);
         payload.extend_from_slice(&1u32.to_le_bytes());
+        if let Some((uid, gid)) = fixed_ids() {
+            payload.extend_from_slice(&uid.to_le_bytes());
+            payload.extend_from_slice(&gid.to_le_bytes());
+        }
         let len_bytes = (payload.len() as u32).to_le_bytes();
         let mut frame = Vec::with_capacity(4 + payload.len());
         frame.extend_from_slice(&len_bytes);
@@ -1124,6 +1128,38 @@ mod linux_ns {
             clone.write_all(&frame[sent..])?;
         }
         Ok(())
+    }
+
+    /// Called in the single-threaded runner, after mounting its private procfs.
+    /// The root runner maps exactly one UID and GID, and nested runners keep
+    /// that user namespace. Confined children inherit these credentials and
+    /// cannot change namespaces or acquire set-ID credentials on exec. The
+    /// single-entry maps also prevent `setfsuid` and `setfsgid` from selecting
+    /// any other ID. So a matching reset stays a no-op in every descendant.
+    fn fixed_ids() -> Option<(u32, u32)> {
+        // SAFETY: `getuid` and `getgid` are pure queries with no preconditions.
+        let (uid, gid) = unsafe { (getuid(), getgid()) };
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let matches = |field: &str, id, overflow: &str| -> Option<()> {
+            let overflow: u32 = std::fs::read_to_string(overflow)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            // procfs reports unmapped credentials as the overflow ID. It
+            // cannot prove equality when the mapped ID is that same number.
+            if id == 0 || id == overflow {
+                return None;
+            }
+            let ids = status.lines().find_map(|line| line.strip_prefix(field))?;
+            ids.split_ascii_whitespace()
+                .map(str::parse::<u32>)
+                .eq([Ok(id); 4])
+                .then_some(())
+        };
+        matches("Uid:", uid, "/proc/sys/kernel/overflowuid")?;
+        matches("Gid:", gid, "/proc/sys/kernel/overflowgid")?;
+        Some((uid, gid))
     }
 
     pub fn bootstrap_root(mut control: UnixStream) -> ExitCode {
