@@ -1154,7 +1154,7 @@ mod linux_ns {
             let ids = status.lines().find_map(|line| line.strip_prefix(field))?;
             ids.split_ascii_whitespace()
                 .map(str::parse::<u32>)
-                .eq([Ok(id); 4])
+                .eq([id; 4].map(Ok))
                 .then_some(())
         };
         matches("Uid:", uid, "/proc/sys/kernel/overflowuid")?;
