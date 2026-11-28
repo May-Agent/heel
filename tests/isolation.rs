@@ -78,7 +78,7 @@ async fn fixed_credential_resets_succeed_inside_the_sandbox() {
         .await
         .expect("sandbox starts");
     let output = sandbox
-        .command(&probe)
+        .command(probe.to_str().expect("UTF-8 probe path"))
         .args(["--ignored", "--exact", "credential_reset_probe"])
         .output()
         .await
@@ -100,19 +100,24 @@ fn credential_reset_probe() {
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let unchanged = u32::MAX;
     for (number, id) in [(libc::SYS_setresuid, uid), (libc::SYS_setresgid, gid)] {
-        let invoke = |real, effective, saved| {
+        let invoke = |real: u32, effective: u32, saved: u32| {
             // SAFETY: both syscalls take three scalar IDs.
             unsafe { libc::syscall(number, real, effective, saved) }
         };
-        assert_eq!(
-            invoke(unchanged, id, unchanged),
-            0,
-            "reset for syscall {number}"
-        );
+        let result = invoke(unchanged, id, unchanged);
+        if uid == 0 || gid == 0 {
+            assert_eq!(result, -1, "privileged reset for syscall {number}");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        } else {
+            assert_eq!(result, 0, "reset for syscall {number}");
+        }
         for (real, effective, saved) in [
             (id, id, unchanged),
             (unchanged, id, id),
-            (unchanged, 0, unchanged),
+            (unchanged, u32::from(id == 0), unchanged),
         ] {
             assert_eq!(invoke(real, effective, saved), -1, "syscall {number}");
             assert_eq!(
