@@ -150,7 +150,9 @@ impl LinuxBackend {
             ruleset.grant_private_proc(proc_fd, proc_writable)?;
         }
 
-        let seccomp_filters = seccomp_filter::build_filter(proxy_port.is_some())?.encode_programs();
+        let seccomp_filters =
+            seccomp_filter::build_filter(proxy_port.is_some(), runner.fixed_ids())?
+                .encode_programs();
 
         tracing::info!(%kernel, broker = broker.is_some(), "Linux sandbox backend initialized");
         Ok(Self {

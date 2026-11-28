@@ -65,6 +65,69 @@ async fn an_explicitly_readable_path_is_readable() {
     assert_eq!(stdout(&output), "token-value");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fixed_credential_resets_succeed_inside_the_sandbox() {
+    let dir = fixtures::tempdir();
+    let probe = dir.path().join("credential-probe");
+    std::fs::copy(std::env::current_exe().expect("test binary"), &probe).expect("copy binary");
+    let config = SandboxConfigBuilder::default()
+        .executable(fixtures::resolved(&probe))
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+    let output = sandbox
+        .command(probe.to_str().expect("UTF-8 probe path"))
+        .args(["--ignored", "--exact", "credential_reset_probe"])
+        .output()
+        .await
+        .expect("probe runs");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("1 passed"), "{}", stdout(&output));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run by fixed_credential_resets_succeed_inside_the_sandbox"]
+fn credential_reset_probe() {
+    // SAFETY: these queries have no preconditions.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let unchanged = u32::MAX;
+    for (number, id) in [(libc::SYS_setresuid, uid), (libc::SYS_setresgid, gid)] {
+        let invoke = |real: u32, effective: u32, saved: u32| {
+            // SAFETY: both syscalls take three scalar IDs.
+            unsafe { libc::syscall(number, real, effective, saved) }
+        };
+        let result = invoke(unchanged, id, unchanged);
+        if uid == 0 || gid == 0 {
+            assert_eq!(result, -1, "privileged reset for syscall {number}");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        } else {
+            assert_eq!(result, 0, "reset for syscall {number}");
+        }
+        for (real, effective, saved) in [
+            (id, id, unchanged),
+            (unchanged, id, id),
+            (unchanged, u32::from(id == 0), unchanged),
+        ] {
+            assert_eq!(invoke(real, effective, saved), -1, "syscall {number}");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_persistent_identity_grant_is_readable_without_an_ordinary_grant() {
     let (directory, secret) = secret_file();
