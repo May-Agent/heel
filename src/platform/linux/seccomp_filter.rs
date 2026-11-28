@@ -15,12 +15,11 @@ use crate::error::{Error, Result};
 
 /// Compiled filters, ready to be applied after fork.
 ///
-/// Two programs rather than one, because a `SeccompFilter` carries a single
-/// action for everything it matches and `clone3` needs a different one. Their
-/// rule sets are disjoint, so each returns `Allow` wherever the other decides
-/// and the kernel's "most restrictive result wins" leaves no ambiguity.
+/// A `SeccompFilter` carries a single action for everything it matches. The
+/// general denial filter is installed before the filters for special results.
 pub(crate) struct PreparedFilter {
     programs: Vec<seccompiler::BpfProgram>,
+    credential_reset: Option<(FixedIds, seccompiler::BpfProgram)>,
     /// Programs written by hand, installed after the compiled ones.
     raw: Vec<Vec<libc::sock_filter>>,
 }
@@ -28,10 +27,15 @@ pub(crate) struct PreparedFilter {
 impl PreparedFilter {
     /// Install the filters on the current process. Called from `pre_exec`.
     ///
-    /// Safe to call there: the programs are compiled before forking, so this
-    /// only issues `prctl` and `seccomp` syscalls.
+    /// Safe to call there: all programs were compiled before forking and the
+    /// child only queries its credentials and installs filters.
     pub(crate) fn apply(self) -> std::io::Result<()> {
         for program in &self.programs {
+            seccompiler::apply_filter(program).map_err(seccomp_error_to_io)?;
+        }
+        if let Some((ids, program)) = &self.credential_reset
+            && ids.match_child()
+        {
             seccompiler::apply_filter(program).map_err(seccomp_error_to_io)?;
         }
         for program in &self.raw {
@@ -97,6 +101,24 @@ pub(crate) fn build_filter(allow_tcp: bool) -> Result<PreparedFilter> {
         arch,
     )?;
 
+    let credential_reset = FixedIds::candidate()
+        .map(|ids| {
+            // ERRNO(0) skips the syscall and reports success. Installed after
+            // the general EPERM filter, it wins only for these argument tuples.
+            let unchanged = u64::from(u32::MAX);
+            let reset = |id| rule(&[(0, unchanged), (1, u64::from(id)), (2, unchanged)]);
+            let program = compile(
+                BTreeMap::from([
+                    (libc::SYS_setresuid, vec![reset(ids.uid)?]),
+                    (libc::SYS_setresgid, vec![reset(ids.gid)?]),
+                ]),
+                SeccompAction::Errno(0),
+                arch,
+            )?;
+            Ok::<_, Error>((ids, program))
+        })
+        .transpose()?;
+
     tracing::debug!(allow_tcp, "seccomp: filters built");
 
     // Installed last, so that where it and an earlier program both answer with
@@ -111,8 +133,86 @@ pub(crate) fn build_filter(allow_tcp: bool) -> Result<PreparedFilter> {
 
     Ok(PreparedFilter {
         programs: vec![denied, unsupported],
+        credential_reset,
         raw,
     })
+}
+
+struct FixedIds {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+impl FixedIds {
+    fn candidate() -> Option<Self> {
+        // SAFETY: both syscalls are pure queries.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let ordinary = |id, overflow| {
+            let overflow: u32 = std::fs::read_to_string(overflow)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            // Linux reports an unmapped credential as the overflow ID. An
+            // equal numeric value cannot prove that the credential matches.
+            (id != 0 && id != overflow).then_some(())
+        };
+        ordinary(uid, "/proc/sys/kernel/overflowuid")?;
+        ordinary(gid, "/proc/sys/kernel/overflowgid")?;
+        Some(Self { uid, gid })
+    }
+
+    /// Only used in the actual child, after applying the baseline filter and
+    /// NO_NEW_PRIVS. Every UID/GID slot must match, including the filesystem ID.
+    /// Namespace changes and ID setters are already denied. Without permitted
+    /// CAP_SETUID/CAP_SETGID, the filesystem setters cannot choose other IDs.
+    /// NO_NEW_PRIVS prevents a later exec from adding those capabilities or
+    /// applying a set-ID bit, so the matching resets stay no-ops after exec.
+    fn match_child(&self) -> bool {
+        #[repr(C)]
+        struct CapabilityHeader {
+            version: u32,
+            pid: i32,
+        }
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct CapabilityData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        // Linux <linux/capability.h>, v3 uses two words per capability set.
+        const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+        const CAP_SETGID: u32 = 6;
+        const CAP_SETUID: u32 = 7;
+        let mut header = CapabilityHeader {
+            version: CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut capabilities = [CapabilityData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        let mut uids = [0; 3];
+        let mut gids = [0; 3];
+        let [ruid, euid, suid] = &mut uids;
+        let [rgid, egid, sgid] = &mut gids;
+
+        // SAFETY: all pointers refer to initialized ABI-sized output slots.
+        // An ID of -1 is unmappable, so setfsuid/setfsgid only return the
+        // current filesystem ID without changing it.
+        unsafe {
+            libc::getresuid(ruid, euid, suid) == 0
+                && libc::getresgid(rgid, egid, sgid) == 0
+                && uids == [self.uid; 3]
+                && gids == [self.gid; 3]
+                && libc::setfsuid(libc::uid_t::MAX) as libc::uid_t == self.uid
+                && libc::setfsgid(libc::gid_t::MAX) as libc::gid_t == self.gid
+                && libc::syscall(libc::SYS_capget, &raw mut header, capabilities.as_mut_ptr()) == 0
+                && capabilities[0].permitted & ((1 << CAP_SETUID) | (1 << CAP_SETGID)) == 0
+        }
+    }
 }
 
 /// Compile one rule set into a BPF program.
