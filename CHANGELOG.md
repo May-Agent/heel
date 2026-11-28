@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/May-Agent/heel/compare/heel-v0.10.1...heel-v0.10.2) - 2026-11-28
+
+### Added
+
+- add per-command PTY spawn with terminal isolation
+- *(unix)* synchronize live grants and dynamic read denials
+- *(unix)* run each sandbox inside a persistent OS-isolated runner
+
+### Fixed
+
+- *(linux)* relocate ruleset, broker, and inherited fds before dup2 in pre_exec
+- handle procfs PTY slave fd links in Linux broker and Windows clippy
+- *(linux)* preserve caller SO_PEERCRED for multi-threaded Unix socket clients
+- *(ci)* run cargo-audit directly so merge_group does not fail on Checks API 404
+- *(linux)* preserve caller SO_PEERCRED on single-threaded Unix socket connect
+- *(macos)* allow Unix domain sockets inside writable granted paths and working_dir
+- *(linux)* preserve supervised child stdio pipes and send pool ruleset fds over SCM_RIGHTS
+
+### Other
+
+- Exercise resets through a runnable Linux credential probe
+- Compare runner credential slots without copying parse errors
+- Preserve fixed credential resets in the Linux sandbox
+- Revert "ci: skip stow on Windows ARM64"
+- skip stow on Windows ARM64
+- replace rust-cache with water-rs/stow
+- assert denylisted Unix socket rejection across platforms
+- *(macos)* narrow deny_all outbound assertion to IP rules
+- Scope crossterm to macOS, where the pty module uses it
+- replace the cargo-machete job with cargo::unused_dependencies
+- Keep macOS SandboxConfig::grants in static SBPL without issuing extensions
+- Fall back to static SBPL for macOS initial read/exec grants refused EPERM
+- *(linux)* avoid namespace pid collision in nested signal check
+- *(linux)* skip a broker thread that ends while its table is read
+- *(linux)* report why a broker thread's descriptor table cannot be read
+
 ## [0.10.1](https://github.com/May-Agent/heel/compare/heel-v0.10.0...heel-v0.10.1) - 2026-11-12
 
 ### Fixed
